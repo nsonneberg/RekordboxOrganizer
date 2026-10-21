@@ -153,13 +153,14 @@ class App(ttk.Frame):
                   else "running from source", foreground="gray"
                   ).grid(row=0, column=2, sticky="e")
 
-        # Shown when a newer version is out.
-        self.update_bar = ttk.Frame(self)
+        # Shown when a newer version is out. It lives inside the title frame:
+        # hidden in the main grid, its row would be taken by the next section.
+        self.update_bar = ttk.Frame(title)
         self.update_label = ttk.Label(self.update_bar, foreground="#0a6")
         self.update_label.grid(row=0, column=0, sticky="w")
         self.update_btn = ttk.Button(self.update_bar, text="Update now", command=self.update_app)
         self.update_btn.grid(row=0, column=1, padx=(10, 0))
-        self.update_bar.grid(sticky="ew", pady=(6, 0))
+        self.update_bar.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(6, 0))
         self.update_bar.grid_remove()
 
         # Step 1 - library
@@ -570,8 +571,14 @@ class App(ttk.Frame):
         def work():
             try:
                 found.put(updater.check())
-            except Exception:
-                found.put(None)    # offline or GitHub unreachable: try next time
+            except Exception as exc:   # offline or GitHub unreachable: try next time
+                found.put(None)
+                try:
+                    with open(os.path.join(organizer.app_data_dir(), "update-check.log"),
+                              "w", encoding="utf-8") as f:
+                        f.write(f"{type(exc).__name__}: {exc}\n")
+                except OSError:
+                    pass
 
         def wait():
             try:
