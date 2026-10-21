@@ -80,9 +80,11 @@ open the download page so you can update by hand.
 
 On a Mac, the app must be in your **Applications** folder to update itself.
 
-**Version 1.0.0 can't update itself** (the feature came later). If you have it, download
-the newest version once using the links above. Every version after that updates with
-the button.
+**Older versions:** 1.0.0 and 1.1.0 can't update themselves (1.1.0's button stays
+hidden), so download the newest version once using the links above. Updating *from*
+1.1.1 works, but the app may show "Failed to load Python DLL" instead of restarting.
+Click OK and open the app again: it's already updated. Every later version restarts
+by itself.
 
 **Running from source?** Update with `git pull` in the app's folder, or download the
 ZIP again.

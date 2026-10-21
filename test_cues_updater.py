@@ -88,7 +88,10 @@ class UpdaterTests(unittest.TestCase):
             self.assertEqual(f.read(), b"new version")
         with open(exe + ".old", "rb") as f:
             self.assertEqual(f.read(), b"old version")
-        started.assert_called_once_with([exe], close_fds=True)
+        self.assertEqual(started.call_args.args, ([exe],))
+        env = started.call_args.kwargs["env"]
+        self.assertEqual(env.get("PYINSTALLER_RESET_ENVIRONMENT"), "1")
+        self.assertFalse(any(k.startswith("_PYI_") for k in env))
         self.assertEqual(seen[-1], (11, 11))
         with mock.patch.object(sys, "executable", exe), \
              mock.patch.object(sys, "frozen", True, create=True):

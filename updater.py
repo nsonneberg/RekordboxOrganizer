@@ -86,6 +86,19 @@ def cleanup_old() -> None:
                 pass   # still closing; next time
 
 
+def _fresh_environment() -> dict:
+    """Our environment minus PyInstaller's own settings.
+
+    A bundled app passes these on to programs it starts; the new version
+    would then look for its files in this version's temporary folder, which
+    is deleted when this one quits ("Failed to load Python DLL").
+    """
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(("_PYI_", "_MEIPASS")) and k != "TCL_LIBRARY" and k != "TK_LIBRARY"}
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    return env
+
+
 def install(url: str, progress: Callable[[int, int], None]) -> None:
     """Download and swap in the new version, then start it. The caller should quit."""
     if sys.platform == "win32":
@@ -100,7 +113,7 @@ def install(url: str, progress: Callable[[int, int], None]) -> None:
         except OSError:
             os.replace(old, exe)        # put the current version back
             raise
-        subprocess.Popen([exe], close_fds=True)
+        subprocess.Popen([exe], close_fds=True, env=_fresh_environment())
         return
 
     # macOS: sys.executable is .../Name.app/Contents/MacOS/Name
@@ -127,4 +140,4 @@ def install(url: str, progress: Callable[[int, int], None]) -> None:
         # The old bundle can go once the new one is in place; the running
         # process keeps its open files until it quits.
         shutil.rmtree(work, ignore_errors=True)
-    subprocess.Popen(["open", "-n", app])
+    subprocess.Popen(["open", "-n", app], env=_fresh_environment())
