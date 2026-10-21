@@ -253,3 +253,8 @@ See [Installing](#installing) for how to get past that.
 ## Credits
 
 Reading and writing the rekordbox database uses [pyrekordbox](https://github.com/dylanljones/pyrekordbox).
+
+## License
+
+[MIT](LICENSE): free to use, copy, change and share, including commercially, as long as
+the copyright notice is kept.
