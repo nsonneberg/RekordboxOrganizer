@@ -13,6 +13,8 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 import organizer
+import updater
+from version import VERSION
 
 APP_NAME = "Rekordbox Organizer"
 MAX_PLAYLISTS = 30
@@ -116,7 +118,7 @@ class App(ttk.Frame):
         defaults = organizer.Options(custom_enabled=True)
         self.vars = {name: tk.BooleanVar(value=getattr(defaults, name)) for name in (
             "custom_enabled", "custom_leftovers", "guess_genres", "auto_genres", "merge_existing",
-            "energy", "energy_ratings", "keep_ratings",
+            "energy", "energy_ratings", "keep_ratings", "phrase_cues",
             "genre", "bpm", "key", "artist", "label", "year", "rating", "colour",
             "date_added", "duplicates", "missing_files", "missing_info", "never_played")}
         self.bpm_step = tk.IntVar(value=defaults.bpm_step)
@@ -143,7 +145,22 @@ class App(ttk.Frame):
     def _build(self):
         self.columnconfigure(0, weight=1)
 
-        ttk.Label(self, text=APP_NAME, font=("", 16, "bold")).grid(sticky="w")
+        title = ttk.Frame(self)
+        title.grid(sticky="ew")
+        title.columnconfigure(1, weight=1)
+        ttk.Label(title, text=APP_NAME, font=("", 16, "bold")).grid(row=0, column=0, sticky="w")
+        ttk.Label(title, text="version " + VERSION if VERSION[0].isdigit() and "dev" not in VERSION
+                  else "running from source", foreground="gray"
+                  ).grid(row=0, column=2, sticky="e")
+
+        # Shown when a newer version is out.
+        self.update_bar = ttk.Frame(self)
+        self.update_label = ttk.Label(self.update_bar, foreground="#0a6")
+        self.update_label.grid(row=0, column=0, sticky="w")
+        self.update_btn = ttk.Button(self.update_bar, text="Update now", command=self.update_app)
+        self.update_btn.grid(row=0, column=1, padx=(10, 0))
+        self.update_bar.grid(sticky="ew", pady=(6, 0))
+        self.update_bar.grid_remove()
 
         # Step 1 - library
         step1 = ttk.LabelFrame(self, text=" 1. Your rekordbox library ", padding=10)
@@ -211,6 +228,16 @@ class App(ttk.Frame):
                        "sound, learned from your tagged songs. Guessed songs go in "
                        "'(detected)' playlists so you can check them."
                   ).grid(row=2, column=0, sticky="w", pady=(4, 0))
+
+        cue_box = ttk.LabelFrame(self, text=" Hot cues ", padding=(10, 4))
+        cue_box.grid(sticky="ew", pady=(12, 0))
+        self.cues_cb = check(cue_box, "phrase_cues",
+                             "Add hot cues where sections start (Intro, Build-up, Drop, "
+                             "Breakdown, Chorus, Outro)", 0, 0)
+        ttk.Label(cue_box, foreground="gray", wraplength=760, justify="left",
+                  text="Uses rekordbox's phrase analysis. Only empty pads (A-H) are used and "
+                       "your own hot cues are never moved. Works straight from rekordbox only."
+                  ).grid(row=1, column=0, sticky="w")
 
         # Step 4 - playlists (tabs)
         ttk.Label(self, text="4. Playlists", font=("", 10, "bold")).grid(sticky="w", pady=(12, 2))
@@ -344,6 +371,7 @@ class App(ttk.Frame):
         ranged = "normal" if self.date_mode.get() == "range" else "disabled"
         for w in (self.from_entry, self.to_entry):
             w.configure(state=ranged)
+        self.cues_cb.configure(state="disabled" if xml else "normal")
         energy = self.vars["energy"].get()
         self.energy_ratings_cb.configure(state="normal" if energy else "disabled")
         self.keep_ratings_cb.configure(
@@ -462,6 +490,8 @@ class App(ttk.Frame):
         opt = self.collect_options()
         try:
             organizer.compile_custom(opt)    # catch typos in the rules right away
+            if xml_path:
+                opt.phrase_cues = False
             organizer.select_tracks([], opt)  # ...and in the dates
         except ValueError as exc:
             messagebox.showwarning(APP_NAME, str(exc))
@@ -528,6 +558,93 @@ class App(ttk.Frame):
             pass
         self.after(50, self.poll)
 
+    # ------------------------------------------------------------- updates --
+
+    def check_for_update(self):
+        """Look for a newer release in the background (built apps only)."""
+        updater.cleanup_old()
+        if not updater.can_self_update():
+            return
+        found: queue.Queue = queue.Queue()
+
+        def work():
+            try:
+                found.put(updater.check())
+            except Exception:
+                found.put(None)    # offline or GitHub unreachable: try next time
+
+        def wait():
+            try:
+                self.new_release = found.get_nowait()
+            except queue.Empty:
+                self.after(300, wait)
+                return
+            if self.new_release:
+                self.update_label.configure(
+                    text=f"Version {self.new_release['version']} is available.")
+                self.update_bar.grid()
+
+        threading.Thread(target=work, daemon=True).start()
+        self.after(300, wait)
+
+    def update_app(self):
+        info = getattr(self, "new_release", None)
+        if not info:
+            return
+        if not info["url"]:
+            import webbrowser
+            webbrowser.open(info["page"])
+            return
+        notes = info["notes"].strip()
+        if len(notes) > 600:
+            notes = notes[:600].rstrip() + " ..."
+        if not messagebox.askokcancel(
+                APP_NAME, f"Install version {info['version']}? The app will restart."
+                          + (f"\n\nWhat's new:\n{notes}" if notes else "")):
+            return
+        self.save_settings()
+        for w in (self.update_btn, self.run_btn):
+            w.configure(state="disabled")
+        self.update_label.configure(text=f"Downloading version {info['version']} ...")
+        self.progress.configure(mode="determinate", value=0, maximum=1)
+        status: queue.Queue = queue.Queue()
+
+        def work():
+            try:
+                updater.install(info["url"], lambda done, total: status.put(("progress", (done, total))))
+                status.put(("done", None))
+            except Exception as exc:
+                status.put(("error", str(exc)))
+
+        def poll():
+            try:
+                while True:
+                    kind, payload = status.get_nowait()
+                    if kind == "progress":
+                        done, total = payload
+                        self.progress.configure(maximum=max(total, done, 1), value=done)
+                    elif kind == "done":
+                        self.master.destroy()     # the new version is starting
+                        return
+                    else:
+                        self.progress.configure(value=0)
+                        self.update_btn.configure(state="normal")
+                        self.run_btn.configure(state="normal")
+                        self.update_label.configure(
+                            text=f"Version {info['version']} is available.")
+                        if messagebox.askyesno(
+                                APP_NAME, f"The update didn't work:\n{payload}\n\n"
+                                          "Open the download page instead?"):
+                            import webbrowser
+                            webbrowser.open(info["page"])
+                        return
+            except queue.Empty:
+                pass
+            self.after(100, poll)
+
+        threading.Thread(target=work, daemon=True).start()
+        self.after(100, poll)
+
     def finish(self):
         self.progress.stop()
         self.progress.configure(mode="determinate", value=0)
@@ -553,12 +670,13 @@ def main():
             pass
     root = tk.Tk()
     root.title(APP_NAME)
-    App(root)
+    app = App(root)
     # Fit on small or scaled screens: the log box shrinks first.
     root.update_idletasks()
     height = min(root.winfo_reqheight(), root.winfo_screenheight() - 100)
     root.geometry(f"{root.winfo_reqwidth()}x{height}+40+20")
     root.minsize(600, min(560, height))
+    app.check_for_update()
     root.mainloop()
 
 

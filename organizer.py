@@ -11,6 +11,7 @@ import os
 import re
 import xml.etree.ElementTree as ET
 from collections import defaultdict
+import dataclasses
 import datetime
 import sys
 from dataclasses import dataclass, field
@@ -95,6 +96,7 @@ class Options:
     energy: bool = False         # listen to the music and score energy 1-5
     energy_ratings: bool = True  # ...and set the star rating to the energy level
     keep_ratings: bool = True    # ...except on tracks that already have a rating
+    phrase_cues: bool = False    # hot cues where sections start (direct mode only)
     # Automatic playlists: all off unless asked for.
     genre: bool = False
     bpm: bool = False
@@ -675,8 +677,9 @@ def apply_energy(tracks: list[Track], opt: Options, features: dict[str, dict],
 
 
 def _organize(tracks: list[Track], opt: Options, log: Callable[[str], None],
-              progress: Optional[Callable[[int, int], None]]) -> tuple[Plan, dict[str, int], int]:
-    """Shared by both modes: (plan, new star ratings, number of playlists)."""
+              progress: Optional[Callable[[int, int], None]]
+              ) -> tuple[Plan, dict[str, int], list[Track]]:
+    """Shared by both modes: (plan, new star ratings, the tracks chosen to organize)."""
     rules = compile_custom(opt)          # validate before any slow work
     library = tracks
     tracks = select_tracks(library, opt)
@@ -705,10 +708,9 @@ def _organize(tracks: list[Track], opt: Options, log: Callable[[str], None],
         guesses = genres.guess_genres(library, features, log)
 
     plan = build_plan(tracks, opt, rules, guesses)
-    if not plan and not ratings:
+    if not plan and not ratings and not opt.phrase_cues:
         raise ValueError("Nothing to do - tick at least one option.")
 
-    total = 0
     shown_parents = set()
     for folder, lists in plan:
         path = folder_path(folder)
@@ -732,8 +734,7 @@ def _organize(tracks: list[Track], opt: Options, log: Callable[[str], None],
                 f"{len(lists)} playlist{'s' if len(lists) != 1 else ''}")
         else:
             log(f"  {path[0]}: {len(lists)} playlist{'s' if len(lists) != 1 else ''}")
-        total += len(lists)
-    return plan, ratings, total
+    return plan, ratings, tracks
 
 
 def run(opt: Options, xml_path: Optional[str] = None, log: Callable[[str], None] = print,
@@ -750,7 +751,11 @@ def run(opt: Options, xml_path: Optional[str] = None, log: Callable[[str], None]
         log(f"Found {len(tracks)} tracks.")
         if not tracks:
             raise ValueError("The collection in this XML file is empty.")
-        plan, ratings, total = _organize(tracks, opt, log, progress)
+        if opt.phrase_cues:
+            log("Hot cues need rekordbox's phrase analysis, so they're only added when "
+                "working straight from rekordbox. Skipping them.")
+            opt = dataclasses.replace(opt, phrase_cues=False)
+        plan, ratings, _ = _organize(tracks, opt, log, progress)
         out_path = default_output_path(xml_path)
         changes = write_library(tree, plan, folder_name, out_path, ratings,
                                 opt.merge_existing, log)
@@ -769,15 +774,18 @@ def run(opt: Options, xml_path: Optional[str] = None, log: Callable[[str], None]
         log(f"Found {len(tracks)} tracks.")
         if not tracks:
             raise ValueError("Your rekordbox collection is empty.")
-        plan, ratings, total = _organize(tracks, opt, log, progress)
+        plan, ratings, chosen = _organize(tracks, opt, log, progress)
+        hot_cues = rbdb.plan_hot_cues(db, chosen, log) if opt.phrase_cues else {}
 
         if rbdb.rekordbox_running():
             raise ValueError("rekordbox was opened while working. Nothing was changed - "
                              "close rekordbox and press Run again.")
         log(f"Backed up your library to {os.path.basename(rbdb.backup(db_path))}")
+        rbdb.add_hot_cues(db, contents, hot_cues, log)     # saved with everything below
         changes = rbdb.write_changes(db, contents, plan, folder_name, ratings, log,
                                      opt.merge_existing)
-        log(describe_changes(*changes))
+        if plan:
+            log(describe_changes(*changes))
         return db_path
     finally:
         db.close()

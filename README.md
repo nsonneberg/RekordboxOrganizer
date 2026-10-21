@@ -63,14 +63,36 @@ xattr -dr com.apple.quarantine "/Applications/Rekordbox Organizer.app"
 **Intel Macs:** the download only runs on Apple Silicon. Use
 [Running from source](#running-from-source) instead.
 
-### Updating and uninstalling
+### Updating
 
-- **Update:** download the newest release and replace the old `.exe` or `.app` with it.
-  Your settings are kept.
-- **Uninstall:** delete the `.exe` or `.app`. To also remove its settings and energy
-  cache, delete `%APPDATA%\RekordboxOrganizer` on Windows or
-  `~/Library/Application Support/RekordboxOrganizer` on macOS. Your rekordbox library
-  and the backups the app made are left alone.
+You only download the app once. After that it updates itself:
+
+1. When the app opens, it checks GitHub for a newer version. This takes a second and
+   happens in the background.
+2. If there is one, a green **"Version X is available"** line appears under the title,
+   with an **Update now** button.
+3. Click **Update now** and confirm. The app shows what's new, downloads the new
+   version, replaces itself and restarts. Your settings and playlists are kept.
+
+The version you have is shown in the top-right corner of the window. If you're offline,
+the check is skipped and tried again next time. If an update fails, the app offers to
+open the download page so you can update by hand.
+
+On a Mac, the app must be in your **Applications** folder to update itself.
+
+**Version 1.0.0 can't update itself** (the feature came later). If you have it, download
+the newest version once using the links above. Every version after that updates with
+the button.
+
+**Running from source?** Update with `git pull` in the app's folder, or download the
+ZIP again.
+
+### Uninstalling
+
+Delete the `.exe` or `.app`. To also remove its settings and energy cache, delete
+`%APPDATA%\RekordboxOrganizer` on Windows or
+`~/Library/Application Support/RekordboxOrganizer` on macOS. Your rekordbox library
+and the backups the app made are left alone.
 
 ## What it can do
 
@@ -127,6 +149,15 @@ Organized
    ├─ Drum & Bass
    └─ Unknown Genre            ← no tag and no analysis to guess from
 ```
+
+**Hot cues at phrase changes:** puts hot cues where each section of a track starts
+(Intro, Build-up, Drop, Breakdown, Chorus, Verse, Bridge, Outro), named and coloured
+by section. The positions come from rekordbox's own phrase analysis, so they land on
+the beat. Only empty pads (A–H) are used. Hot cues you set yourself are never moved
+or replaced, and running again doesn't add duplicates. If a track has more sections
+than empty pads, drops and build-ups win. Works straight from rekordbox only, not with
+an XML export. Tracks need phrase analysis, which is on by default; otherwise turn on
+**Preferences → Analysis → Phrase** in rekordbox and re-analyse them.
 
 **Energy:** measures each track's loudness, rhythmic activity, brightness,
 hi-hat/percussion content and BPM. Working straight from rekordbox, it reads the colour
