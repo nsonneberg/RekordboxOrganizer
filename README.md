@@ -8,6 +8,69 @@ set the track's star rating to match.
 
 Your music files are never moved, renamed or edited.
 
+## Installing
+
+You don't need Python or anything else. The app is a single download.
+
+### Get the download
+
+1. Sign in to GitHub and open this repository's **Actions** tab.
+2. Click **Build apps** on the left, then the newest run with a green ✓.
+3. Scroll down to **Artifacts** and click the one for your computer:
+   - **rekordbox-organizer-Windows** for Windows 10 / 11
+   - **rekordbox-organizer-macOS** for a Mac with Apple Silicon (M1 or newer)
+
+The download is a `.zip` file. Downloads stay available for 90 days after each build.
+
+### Windows
+
+1. Open your **Downloads** folder, right-click `rekordbox-organizer-Windows.zip` and
+   choose **Extract All… → Extract**.
+2. Move `Rekordbox Organizer.exe` somewhere permanent, e.g. your **Documents** folder.
+3. Double-click it. The first time, Windows may show *"Windows protected your PC"*.
+   Click **More info → Run anyway**. It takes a few seconds to start.
+4. Optional: to add it to your desktop, right-click the `.exe` and choose
+   **Show more options → Send to → Desktop (create shortcut)**.
+
+If **Smart App Control** blocks it outright and offers no "Run anyway" button, use
+[Running from source](#running-from-source) instead. Smart App Control blocks apps
+that aren't signed by a known publisher.
+
+### macOS
+
+1. Double-click `rekordbox-organizer-macOS.zip` in **Downloads**. If you get another
+   `.zip`, double-click that too, until you have **Rekordbox Organizer.app**.
+2. Drag **Rekordbox Organizer.app** into your **Applications** folder.
+3. The first time, open it like this. The app isn't signed by Apple, so double-clicking
+   only shows a warning.
+   - **macOS 14 Sonoma or older:** right-click (or Control-click) the app → **Open** →
+     **Open**.
+   - **macOS 15 Sequoia or newer:** double-click the app and click **Done** on the
+     warning. Then go to **System Settings → Privacy & Security**, scroll down, click
+     **Open Anyway** next to "Rekordbox Organizer", and confirm with your password.
+4. After that, it opens normally from Applications or Launchpad. If macOS asks for
+   access to your Music or other folders, click **Allow**. The app needs it to read
+   your tracks.
+
+If macOS says the app *"is damaged and can't be opened"*, open **Terminal** and run
+this, then try again:
+
+```
+xattr -dr com.apple.quarantine "/Applications/Rekordbox Organizer.app"
+```
+
+**Intel Macs:** the download only runs on Apple Silicon. Use
+[Running from source](#running-from-source) instead.
+
+### Updating and uninstalling
+
+- **Update:** download the newest build and replace the old `.exe` or `.app` with it.
+  Your settings are kept.
+- **Uninstall:** delete the `.exe` or `.app`. To also remove its settings and energy
+  cache, delete `%APPDATA%\RekordboxOrganizer` on Windows or
+  `~/Library/Application Support/RekordboxOrganizer` on macOS. Your rekordbox library
+  and the backups the app made are left alone.
+
 ## What it can do
 
 **Your own playlists:** choose how many playlists you want, name each one, and
@@ -130,15 +193,35 @@ through the built-in `afconvert`.
 
 ## Running from source
 
-You need Python 3.9 or newer, with Tkinter. The python.org installers include it.
+Use this if the download is blocked (e.g. by Windows Smart App Control) or you
+have an Intel Mac.
 
+1. Install Python 3.9 or newer from [python.org](https://www.python.org/downloads/).
+   Its installers include Tkinter, which the app needs. On Windows, tick
+   **Add python.exe to PATH** in the installer.
+2. Download this repository: green **Code** button → **Download ZIP**, then unzip it.
+3. Open a terminal in the unzipped folder (Windows: right-click the folder →
+   **Open in Terminal**; macOS: open **Terminal**, type `cd `, drag the folder in, and
+   press Return). Then run:
+
+**Windows**
 ```
 python -m venv .venv
-.venv\Scripts\activate          # macOS: source .venv/bin/activate
+.venv\Scripts\activate
 pip install -r requirements.txt
-python app.py                   # launch the app
-python -m unittest -v           # run the tests
+python app.py
 ```
+
+**macOS**
+```
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python app.py
+```
+
+To start it again later, open a terminal in the folder and run only the `activate`
+line and `python app.py`. To run the tests: `python -m unittest -v`.
 
 ## Building the double-click apps
 
@@ -154,8 +237,8 @@ PyInstaller can only build for the OS it runs on. To get both builds from one pl
 push this repo to GitHub: `.github/workflows/build.yml` builds both on every `v*` tag,
 or you can start it by hand from the Actions tab.
 
-The macOS build isn't signed. The first time you open it, right-click the app and
-choose **Open**.
+The builds aren't signed, so Windows and macOS warn the first time they're opened.
+See [Installing](#installing) for how to get past that.
 
 ## Credits
 
