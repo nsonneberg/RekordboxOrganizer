@@ -1,0 +1,37 @@
+name: Build apps
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m unittest -v
+      - run: pip install pyinstaller
+
+      - name: Build Windows exe
+        if: runner.os == 'Windows'
+        run: pyinstaller --noconfirm --onefile --windowed --name "Rekordbox Organizer" app.py
+
+      - name: Build macOS app
+        if: runner.os == 'macOS'
+        run: |
+          pyinstaller --noconfirm --windowed --name "Rekordbox Organizer" app.py
+          cd dist && ditto -c -k --keepParent "Rekordbox Organizer.app" "Rekordbox Organizer-macOS.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rekordbox-organizer-${{ runner.os }}
+          path: |
+            dist/*.exe
+            dist/*.zip
