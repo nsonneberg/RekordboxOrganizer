@@ -14,19 +14,20 @@ You don't need Python or anything else. The app is a single download.
 
 ### Get the download
 
-1. Sign in to GitHub and open this repository's **Actions** tab.
-2. Click **Build apps** on the left, then the newest run with a green ✓.
-3. Scroll down to **Artifacts** and click the one for your computer:
-   - **rekordbox-organizer-Windows** for Windows 10 / 11
-   - **rekordbox-organizer-macOS** for a Mac with Apple Silicon (M1 or newer)
+Sign in to GitHub, then download the newest version for your computer:
 
-The download is a `.zip` file. Downloads stay available for 90 days after each build.
+- **Windows 10 / 11:** [Rekordbox-Organizer-Windows.exe](../../releases/latest/download/Rekordbox-Organizer-Windows.exe)
+- **Mac with Apple Silicon (M1 or newer):** [Rekordbox-Organizer-macOS.zip](../../releases/latest/download/Rekordbox-Organizer-macOS.zip)
+
+All versions are on the [Releases page](../../releases) (also linked on the right of
+the repository's front page).
 
 ### Windows
 
-1. Open your **Downloads** folder, right-click `rekordbox-organizer-Windows.zip` and
-   choose **Extract All… → Extract**.
-2. Move `Rekordbox Organizer.exe` somewhere permanent, e.g. your **Documents** folder.
+1. Move `Rekordbox-Organizer-Windows.exe` from **Downloads** somewhere permanent, e.g.
+   your **Documents** folder. You can rename it to `Rekordbox Organizer.exe`.
+2. If your browser warns that the file "isn't commonly downloaded", choose **Keep**
+   (in Edge: **…** → **Keep** → **Keep anyway**).
 3. Double-click it. The first time, Windows may show *"Windows protected your PC"*.
    Click **More info → Run anyway**. It takes a few seconds to start.
 4. Optional: to add it to your desktop, right-click the `.exe` and choose
@@ -38,8 +39,8 @@ that aren't signed by a known publisher.
 
 ### macOS
 
-1. Double-click `rekordbox-organizer-macOS.zip` in **Downloads**. If you get another
-   `.zip`, double-click that too, until you have **Rekordbox Organizer.app**.
+1. Double-click `Rekordbox-Organizer-macOS.zip` in **Downloads** to get
+   **Rekordbox Organizer.app**. Safari may already have unzipped it for you.
 2. Drag **Rekordbox Organizer.app** into your **Applications** folder.
 3. The first time, open it like this. The app isn't signed by Apple, so double-clicking
    only shows a warning.
@@ -64,7 +65,7 @@ xattr -dr com.apple.quarantine "/Applications/Rekordbox Organizer.app"
 
 ### Updating and uninstalling
 
-- **Update:** download the newest build and replace the old `.exe` or `.app` with it.
+- **Update:** download the newest release and replace the old `.exe` or `.app` with it.
   Your settings are kept.
 - **Uninstall:** delete the `.exe` or `.app`. To also remove its settings and energy
   cache, delete `%APPDATA%\RekordboxOrganizer` on Windows or
@@ -233,9 +234,18 @@ pyinstaller --onefile --windowed --collect-all pyrekordbox --name "Rekordbox Org
 pyinstaller --windowed --collect-all pyrekordbox --name "Rekordbox Organizer" app.py
 ```
 
-PyInstaller can only build for the OS it runs on. To get both builds from one place,
-push this repo to GitHub: `.github/workflows/build.yml` builds both on every `v*` tag,
-or you can start it by hand from the Actions tab.
+PyInstaller can only build for the OS it runs on, so GitHub Actions builds both
+(`.github/workflows/build.yml`). To publish a new version as a Release, tag it and
+push the tag:
+
+```
+git tag v1.1.0
+git push origin v1.1.0
+```
+
+Both apps are built and tested, then attached to a new Release with notes listing the
+changes since the last one. You can also start a build by hand from the Actions tab;
+that gives downloadable artifacts (kept 90 days) but no Release.
 
 The builds aren't signed, so Windows and macOS warn the first time they're opened.
 See [Installing](#installing) for how to get past that.
