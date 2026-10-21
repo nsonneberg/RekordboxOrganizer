@@ -151,8 +151,8 @@ Organized
 ```
 
 **Hot cues at phrase changes:** puts hot cues where each section of a track starts
-(Intro, Build-up, Drop, Breakdown, Chorus, Verse, Bridge, Outro), named and coloured
-by section. The positions come from rekordbox's own phrase analysis, so they land on
+(Intro, Build-up, Drop, Breakdown, Chorus, Verse, Bridge, Outro), each named after
+its section. The positions come from rekordbox's own phrase analysis, so they land on
 the beat. Only empty pads (A–H) are used. Hot cues you set yourself are never moved
 or replaced, and running again doesn't add duplicates. If a track has more sections
 than empty pads, drops and build-ups win. Works straight from rekordbox only, not with

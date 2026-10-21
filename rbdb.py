@@ -196,13 +196,10 @@ def write_changes(db, contents: dict, plan: Plan, folder_name: str,
     return created, updated, added
 
 
-# Hot cue pads A-H as stored in DjmdCue.Kind (0 is a memory cue).
-# UNVERIFIED: checked against cues made in rekordbox before use.
-HOT_CUES_VERIFIED = False
+# Hot cue pads A-H as stored in DjmdCue.Kind (0 is a memory cue; there's no 4).
+# Checked against hot cues made in rekordbox 7: those live only in master.db
+# (the ANLZ files' cue tags stay empty), with InFrame = InMsec * 150 // 1000.
 HOT_CUE_KINDS = (1, 2, 3, 5, 6, 7, 8, 9)
-# Section label -> rekordbox hot cue colour (ColorTableIndex). UNVERIFIED.
-CUE_COLOURS = {"Intro": 49, "Verse": 9, "Build-up": 37, "Breakdown": 9, "Bridge": 9,
-               "Drop": 42, "Chorus": 42, "Outro": 49}
 
 
 def plan_hot_cues(db, tracks: list[Track], log: Callable[[str], None] = print) -> dict:
@@ -210,8 +207,6 @@ def plan_hot_cues(db, tracks: list[Track], log: Callable[[str], None] = print) -
     import cues
     from pyrekordbox.masterdb import models
 
-    if not HOT_CUES_VERIFIED:
-        raise ValueError("Adding hot cues isn't ready yet - untick 'Add hot cues' and run again.")
     hot: dict[str, list] = {}
     for c in db.query(models.DjmdCue).filter(models.DjmdCue.rb_local_deleted == 0):
         if c.Kind in HOT_CUE_KINDS:
@@ -245,17 +240,21 @@ def add_hot_cues(db, contents: dict, plan: dict, log: Callable[[str], None] = pr
     from pyrekordbox.masterdb import models
 
     now = datetime.datetime.now()
+    taken: set[int] = set()     # IDs handed out but not yet in the database
     for track_id, picks in plan.items():
         content = contents[track_id]
         for pad, phrase in picks:
+            cue_id = db.generate_unused_id(models.DjmdCue, is_28_bit=False)
+            while cue_id in taken:
+                cue_id = db.generate_unused_id(models.DjmdCue, is_28_bit=False)
+            taken.add(cue_id)
             ms = int(phrase.start_ms)
+            # Same fields rekordbox fills in for a hot cue set on a pad.
             db.add(models.DjmdCue.create(
-                ID=str(uuid4()), ContentID=str(content.ID), ContentUUID=content.UUID,
-                InMsec=ms, InFrame=round(ms * 150 / 1000), InMpegFrame=0, InMpegAbs=0,
+                ID=str(cue_id), ContentID=str(content.ID), ContentUUID=content.UUID,
+                InMsec=ms, InFrame=ms * 150 // 1000, InMpegFrame=0, InMpegAbs=0,
                 OutMsec=-1, OutFrame=0, OutMpegFrame=0, OutMpegAbs=0,
-                Kind=HOT_CUE_KINDS[pad], Color=-1, ColorTableIndex=CUE_COLOURS.get(phrase.label, 0),
-                ActiveLoop=0, Comment=phrase.label, BeatLoopSize=0, CueMicrosec=0,
-                InPointSeekInfo="", OutPointSeekInfo="", UUID=str(uuid4()),
-                created_at=now, updated_at=now))
+                Kind=HOT_CUE_KINDS[pad], Color=-1, Comment=phrase.label,
+                UUID=str(uuid4()), created_at=now, updated_at=now))
     if plan:
         log(f"Added {sum(len(p) for p in plan.values())} hot cues.")
