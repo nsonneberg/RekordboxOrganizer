@@ -41,6 +41,41 @@ def banger(seconds=20, bpm=140):
     return np.clip(out, -1, 1)
 
 
+def write_ext(path, heights, low, mid, high):
+    """Write a minimal rekordbox .EXT analysis file with a PWV5 colour waveform."""
+    entries = ((np.asarray(low) << 13) | (np.asarray(mid) << 10) | (np.asarray(high) << 7)
+               | (np.asarray(heights) << 2)).astype(">u2").tobytes()
+    n = len(entries) // 2
+    header = b"PMAI" + (28).to_bytes(4, "big") + (28 + 24 + 2 * n).to_bytes(4, "big") + bytes(16)
+    tag = (b"PWV5" + (24).to_bytes(4, "big") + (24 + 2 * n).to_bytes(4, "big")
+           + (2).to_bytes(4, "big") + n.to_bytes(4, "big") + bytes(4))
+    with open(path, "wb") as f:
+        f.write(header + tag + entries)
+
+
+class WaveformTests(unittest.TestCase):
+    def test_reads_rekordbox_waveform_and_ranks_energy(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d)
+        rng = np.random.default_rng(1)
+        n = 150 * 60
+        quiet = os.path.join(d, "quiet.EXT")       # soft, smooth, mostly lows
+        write_ext(quiet, np.full(n, 8), np.full(n, 6), np.full(n, 2), np.zeros(n, int))
+        loud = os.path.join(d, "loud.EXT")         # loud, punchy, lots of highs
+        write_ext(loud, rng.integers(18, 31, n), np.full(n, 5), np.full(n, 3), np.full(n, 6))
+        broken = os.path.join(d, "broken.EXT")
+        with open(broken, "wb") as f:
+            f.write(b"nope")
+
+        self.assertEqual(len(energy.read_waveform(quiet)), n)
+        logs = []
+        feats = energy.analyse_waveforms({"q": quiet, "l": loud, "x": broken}, logs.append)
+        self.assertEqual(set(feats), {"q", "l"})
+        self.assertIn("1 tracks have no usable analysis", logs[-1])
+        levels = energy.levels_from_features(feats, {})
+        self.assertLess(levels["q"], levels["l"])
+
+
 class EnergyTests(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp()

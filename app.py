@@ -15,10 +15,11 @@ import organizer
 
 APP_NAME = "Rekordbox Organizer"
 MAX_PLAYLISTS = 30
+SETTINGS_VERSION = 2
 
 DIRECT_DONE = (
     "Your library has been updated.\n\n"
-    "Open rekordbox to find the new '{folder}' playlist folder in the sidebar."
+    "Open rekordbox to find your playlists in the '{folder}' folder in the sidebar."
 )
 
 XML_DONE = (
@@ -31,10 +32,9 @@ XML_DONE = (
 )
 
 EXAMPLE_PLAYLISTS = [
-    organizer.CustomPlaylist("House", "house", "118-126", ""),
-    organizer.CustomPlaylist("Techno", "techno", "125-150", ""),
-    organizer.CustomPlaylist("Hip Hop", "hip hop, rap", "", ""),
-    organizer.CustomPlaylist("Peak Time", "", "", "4-5"),
+    organizer.CustomPlaylist("House", "house", "118-130", ""),
+    organizer.CustomPlaylist("Techno", "techno", "130-145", ""),
+    organizer.CustomPlaylist("Hip Hop", "hip hop", "", ""),
 ]
 
 
@@ -170,8 +170,8 @@ class App(ttk.Frame):
                                      "Don't change tracks I've already rated",
                                      2, 0, padx=(44, 0))
         ttk.Label(step2, foreground="gray",
-                  text="1 = calmest 20% of your library, 5 = most energetic 20%. "
-                       "The first run takes a while; after that only new tracks are analysed.",
+                  text="1 = calmest 20% of your library, 5 = most energetic 20%. Straight from "
+                       "rekordbox it uses rekordbox's own track analysis, so it's quick.",
                   wraplength=540, justify="left").grid(row=3, column=0, sticky="w", pady=(4, 0))
 
         # Step 3 - playlists (tabs)
@@ -179,7 +179,7 @@ class App(ttk.Frame):
         tabs = ttk.Notebook(self)
         tabs.grid(sticky="ew")
         tabs.add(self._build_custom_tab(tabs, check), text="  My playlists  ")
-        tabs.add(self._build_auto_tab(tabs, check), text="  Automatic playlists  ")
+        tabs.add(self._build_auto_tab(tabs, check), text="  Extra playlists (optional)  ")
 
         # Run row
         run_row = ttk.Frame(self)
@@ -207,7 +207,7 @@ class App(ttk.Frame):
 
         top = ttk.Frame(tab)
         top.grid(sticky="ew")
-        check(top, "custom_enabled", "Sort my whole library into my own playlists", 0, 0)
+        check(top, "custom_enabled", "Sort my library into these playlists", 0, 0)
         count_row = ttk.Frame(top)
         count_row.grid(row=0, column=1, sticky="e", padx=(16, 0))
         ttk.Label(count_row, text="How many:").pack(side="left")
@@ -226,11 +226,13 @@ class App(ttk.Frame):
         self._resize_rows()
 
         self.leftovers_cb = check(tab, "custom_leftovers",
-                                  f"Put songs that match nothing into '{organizer.LEFTOVERS_NAME}'",
-                                  2, 0)
+                                  f"Also make an '{organizer.LEFTOVERS_NAME}' playlist for songs "
+                                  "that fit nowhere", 2, 0)
         ttk.Label(tab, foreground="gray", wraplength=540, justify="left",
-                  text="Each song goes into the first playlist it matches, top to bottom. "
-                       "Leave a box empty to match anything. Genre: words separated by commas. "
+                  text="A song is added only if it matches every rule you fill in; songs that "
+                       "don't fit are left alone. Genre is relaxed: 'house' also catches "
+                       "Progressive House, Tech-House, Deep House... If a song fits several "
+                       "playlists it goes to the best genre match. "
                        "BPM: 120-126, 128+ or 174. Energy (1-5): 4-5, 3+ or 2."
                   ).grid(row=3, column=0, sticky="w", pady=(4, 0))
         return tab
@@ -315,7 +317,12 @@ class App(ttk.Frame):
                 data = json.load(f)
         except (OSError, ValueError):
             return
-        for name, value in data.get("options", {}).items():
+        options = data.get("options", {})
+        if data.get("version", 1) < SETTINGS_VERSION:
+            # Older versions switched on extra playlists and rating changes by
+            # default; start those fresh and keep only the user's own playlists.
+            options = {k: v for k, v in options.items() if k == "custom_enabled"}
+        for name, value in options.items():
             if name in self.vars and isinstance(value, bool):
                 self.vars[name].set(value)
         for var, key in ((self.source, "source"), (self.xml_path, "xml_path"),
@@ -337,6 +344,7 @@ class App(ttk.Frame):
         self._remember_rows()
         rows = [row.get() for row in self.rows]
         data = {
+            "version": SETTINGS_VERSION,
             "options": {k: v.get() for k, v in self.vars.items()},
             "source": self.source.get(),
             "xml_path": self.xml_path.get(),

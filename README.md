@@ -11,30 +11,41 @@ Your music files are never moved, renamed or edited.
 ## What it can do
 
 **Your own playlists:** choose how many playlists you want, name each one, and
-optionally give it rules:
+give it rules:
 
 | Playlist name | Genre has    | BPM     | Energy |
 |---------------|--------------|---------|--------|
-| House         | house        | 118-126 |        |
-| Techno        | techno       | 125-150 |        |
-| Hip Hop       | hip hop, rap |         |        |
-| Peak Time     |              |         | 4-5    |
+| House         | house        | 118-130 |        |
+| Techno        | techno       | 130-145 |        |
+| Hip Hop       | hip hop      |         |        |
 
-The app goes through every song in your library and puts it in the **first** playlist
-it matches, working top to bottom. Leave a box empty to match anything. Genre words
-match whole words, so "rap" matches "UK Rap" but not "Trap". Songs that match nothing
-go into an **Everything Else** playlist, so no song is left out. If a rule uses energy,
-the app listens to your music automatically. Your playlist setup is saved between runs.
+- A song is added only if it matches **every** rule you fill in. A Techno song at 128 BPM
+  stays out of a `130-145` Techno playlist. An empty box means "any".
+- Genre matching is relaxed. `house` also catches Progressive House, Tech-House and
+  Deephouse; `hip hop` catches Hip-Hop/Rap, Rap, Trap and Drill; `dnb` catches Drum & Bass.
+  Short words only match whole words, so `rap` never catches "Trap".
+- If a song fits more than one playlist, it goes to the best genre match.
+  "Melodic House & Techno" goes to Techno, because the main genre is usually the last word.
+  Rows with a genre win over rows without one. On a tie, the playlist higher in the list wins.
+- Songs that don't fit any playlist are left alone. You can tick a box to also collect
+  them in an **Everything Else** playlist.
+- Your playlists go straight into the main folder (named "Organized" by default), and
+  your setup is saved between runs.
 
-**Energy:** listens to every track and measures loudness, rhythmic activity,
-brightness, hi-hat/percussion content and BPM. Tracks are ranked against the rest
+Songs without a genre tag can't match a genre rule. Tag them in rekordbox first, or use
+BPM/energy-only playlists for them.
+
+**Energy:** measures each track's loudness, rhythmic activity, brightness,
+hi-hat/percussion content and BPM. Working straight from rekordbox, it reads the colour
+waveform rekordbox already made when it analysed the track, so it's fast and works for
+every format. With an XML export, it listens to the audio files instead. Tracks are ranked against the rest
 of your library: 1 = your calmest 20%, 5 = your most energetic 20%. You get a
 "By Energy" playlist folder (1 - Chill, 2 - Warm-up, 3 - Groove, 4 - Driving,
 5 - Peak Time). You can also set each track's star rating to its energy level, and
 leave alone tracks you've already rated. Results are cached, so after the first run
 only new or changed tracks are analysed.
 
-**Automatic playlists by:** Genre · BPM range (step size you choose) · Key (Camelot, in wheel order) ·
+**Extra playlists (optional, all off by default):** Genre · BPM range (step size you choose) · Key (Camelot, in wheel order) ·
 Artist · Record label · Release year · Star rating · Track color · Month added
 
 **Cleanup playlists:** Possible duplicates · Missing files · Missing genre / key / BPM · Never played

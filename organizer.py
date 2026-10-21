@@ -69,11 +69,12 @@ class Track:
     play_count: int
     path: str         # local file path decoded from Location
     energy: int = 0   # 1-5 once analysed, 0 if unknown
+    waveform: str = ""   # rekordbox analysis file (.EXT), direct mode only
 
 
 @dataclass
 class CustomPlaylist:
-    """A playlist the user names, with optional rules. Empty rule = matches anything."""
+    """A playlist the user names. Each filled-in rule must match; empty = any."""
     name: str
     genres: str = ""   # comma-separated words, e.g. "hip hop, rap"
     bpm: str = ""      # e.g. "120-126", "128+", "174"
@@ -84,14 +85,15 @@ class CustomPlaylist:
 class Options:
     custom_enabled: bool = False   # sort the library into the user's own playlists
     custom: list[CustomPlaylist] = field(default_factory=list)
-    custom_leftovers: bool = True  # songs matching no rule go to "Everything Else"
+    custom_leftovers: bool = False  # songs matching no rule go to "Everything Else"
     energy: bool = False         # listen to the music and score energy 1-5
     energy_ratings: bool = True  # ...and set the star rating to the energy level
     keep_ratings: bool = True    # ...except on tracks that already have a rating
-    genre: bool = True
-    bpm: bool = True
+    # Automatic playlists: all off unless asked for.
+    genre: bool = False
+    bpm: bool = False
     bpm_step: int = 5
-    key: bool = True
+    key: bool = False
     artist: bool = False
     label: bool = False
     min_tracks: int = 3          # minimum tracks for Artist / Label playlists
@@ -99,14 +101,15 @@ class Options:
     rating: bool = False
     colour: bool = False
     date_added: bool = False
-    duplicates: bool = True
-    missing_files: bool = True
-    missing_info: bool = True
+    duplicates: bool = False
+    missing_files: bool = False
+    missing_info: bool = False
     never_played: bool = False
     folder_name: str = "Organized"
 
 
-Plan = list[tuple[str, list[tuple[str, list[str]]]]]  # [(folder, [(playlist, [track ids])])]
+# [(folder, [(playlist, [track ids])])]; folder TOP_LEVEL = straight into the main folder
+Plan = list[tuple[str, list[tuple[str, list[str]]]]]
 
 
 # --------------------------------------------------------------------------- #
@@ -224,12 +227,67 @@ def _norm_title(s: str) -> str:
 
 
 LEFTOVERS_NAME = "Everything Else"
-CUSTOM_FOLDER = "My Playlists"
+TOP_LEVEL = ""   # plan folder name meaning "directly inside the main folder"
+
+# Genre words that belong together. Typing any word in a group also matches the
+# others, so "hip hop" catches "Trap" and "dnb" catches "Drum & Bass". Sub-genres
+# that contain the word ("Progressive House", "Tech-House") match anyway.
+GENRE_GROUPS = [
+    ["hip hop", "rap", "trap", "drill", "boom bap"],
+    ["drum and bass", "dnb", "d and b", "drum n bass", "jungle", "liquid", "neurofunk"],
+    ["dubstep", "riddim", "brostep"],
+    ["techno", "tekno"],
+    ["trance", "psytrance", "psy", "goa"],
+    ["edm", "dance", "big room", "electro"],
+    ["r and b", "rnb"],
+    ["garage", "ukg", "speed garage"],
+    ["afrobeats", "afrobeat", "afro", "amapiano"],
+    ["latin", "reggaeton", "dembow", "salsa", "bachata", "cumbia", "merengue"],
+]
 
 
-def _words(text: str) -> str:
-    """Lowercase, punctuation to spaces, padded: ' hip hop ' (for whole-word matching)."""
-    return " " + " ".join(re.sub(r"[^\w]+", " ", text.casefold()).split()) + " "
+def _norm_genre(text: str) -> str:
+    """'Drum & Bass' -> 'drum and bass'; 'Hip-Hop/Rap' -> 'hip hop rap'."""
+    text = text.casefold().replace("&", " and ").replace("+", " and ")
+    return " ".join(re.sub(r"[^\w]+", " ", text).split())
+
+
+_ALIASES: dict[str, set[str]] = {}
+for _group_words in GENRE_GROUPS:
+    for _w in _group_words:
+        _ALIASES.setdefault(_w, set()).update(_group_words)
+
+
+def genre_score(term: str, genre: str) -> Optional[tuple[int, float]]:
+    """How well a normalized genre tag fits a normalized search term (None = not at all).
+
+    Returns (quality, position): quality 3 = exact tag, 2 = contains the word,
+    1 = related word or compound like "deephouse". Position favours matches near
+    the end of the tag, where the main genre usually is ("Melodic House & Techno").
+    """
+    tokens = genre.split()
+    if not tokens:
+        return None
+    if genre == term:
+        return (3, 1.0)
+    padded = f" {genre} "
+    best = None
+    for cand in [term] + sorted(_ALIASES.get(term, set()) - {term}):
+        quality = 2 if cand == term else 1
+        i = padded.find(f" {cand} ")
+        if i >= 0:
+            end = len(padded[: i + len(cand) + 1].split()) - 1
+            score = (quality, (end + 1) / len(tokens))
+            best = score if best is None else max(best, score)
+            continue
+        compact = cand.replace(" ", "")
+        if len(compact) < 4:       # short words ("rap") must match whole, never "trap"
+            continue
+        for idx, tok in enumerate(tokens):
+            if tok == compact or tok.startswith(compact) or tok.endswith(compact):
+                score = (quality if tok == compact else 1, (idx + 1) / len(tokens))
+                best = score if best is None else max(best, score)
+    return best
 
 
 def parse_range(text: str) -> tuple[Optional[int], Optional[int]]:
@@ -250,19 +308,21 @@ def parse_range(text: str) -> tuple[Optional[int], Optional[int]]:
 @dataclass
 class _Rule:
     name: str
-    words: list[str]
+    terms: list[str]       # normalized genre words
     bpm: tuple[Optional[int], Optional[int]]
     energy: tuple[Optional[int], Optional[int]]
 
-    def matches(self, t: Track) -> bool:
-        if self.words and not any(w in _words(t.genre) for w in self.words):
-            return False
+    def score(self, t: Track, genre: str) -> Optional[tuple[int, float]]:
+        """None if the track doesn't fit; otherwise how well it fits (higher = better)."""
         for value, (lo, hi) in ((round(t.bpm), self.bpm), (t.energy, self.energy)):
             if lo is None and hi is None:
                 continue
             if value <= 0 or (lo is not None and value < lo) or (hi is not None and value > hi):
-                return False
-        return True
+                return None
+        if not self.terms:
+            return (0, 0.0)    # no genre rule: fits, but less specifically than a genre match
+        scores = [s for s in (genre_score(term, genre) for term in self.terms) if s]
+        return max(scores) if scores else None
 
 
 def compile_custom(opt: Options) -> list[_Rule]:
@@ -284,8 +344,13 @@ def compile_custom(opt: Options) -> list[_Rule]:
                              "Try 4-5, 3+ or 2, or leave it empty.") from None
         if any(v is not None and not 1 <= v <= 5 for v in energy):
             raise ValueError(f"Playlist '{name}': energy goes from 1 to 5.")
-        words = [_words(w) for w in cp.genres.split(",") if w.strip()]
-        rules.append(_Rule(name, words, bpm, energy))
+        if (energy[0] or 1) <= 1 and (energy[1] is None or energy[1] >= 5):
+            energy = (None, None)          # "1-5" means any energy
+        terms = [_norm_genre(w) for w in cp.genres.split(",") if _norm_genre(w)]
+        if not terms and bpm == (None, None) and energy == (None, None):
+            raise ValueError(f"Playlist '{name}' has no rules, so it would take every song. "
+                             "Give it a genre, BPM or energy, or lower 'How many'.")
+        rules.append(_Rule(name, terms, bpm, energy))
     return rules
 
 
@@ -294,16 +359,23 @@ def rules_need_energy(rules: list[_Rule]) -> bool:
 
 
 def sort_into_custom(tracks: list[Track], rules: list[_Rule], leftovers: bool):
-    """Each track goes into the first playlist it matches. Returns [(name, [ids])]."""
+    """Put each track in the playlist it fits best; tracks that fit none are left alone.
+
+    Returns [(name, [ids])]. Ties go to the playlist higher in the list.
+    """
     lists: list[tuple[str, list[str]]] = [(r.name, []) for r in rules]
     rest: list[str] = []
     for t in sorted(tracks, key=lambda t: (t.bpm, t.artist.casefold(), t.name.casefold())):
-        for rule, (_, ids) in zip(rules, lists):
-            if rule.matches(t):
-                ids.append(t.id)
-                break
-        else:
+        genre = _norm_genre(t.genre)
+        best_i, best_score = None, None
+        for i, rule in enumerate(rules):
+            s = rule.score(t, genre)
+            if s is not None and (best_score is None or s > best_score):
+                best_i, best_score = i, s
+        if best_i is None:
             rest.append(t.id)
+        else:
+            lists[best_i][1].append(t.id)
     if leftovers and rest:
         lists.append((LEFTOVERS_NAME, rest))
     return lists
@@ -315,7 +387,7 @@ def build_plan(tracks: list[Track], opt: Options, rules: Optional[list[_Rule]] =
     if rules is None:
         rules = compile_custom(opt)
     if rules:
-        plan.append((CUSTOM_FOLDER, sort_into_custom(tracks, rules, opt.custom_leftovers)))
+        plan.append((TOP_LEVEL, sort_into_custom(tracks, rules, opt.custom_leftovers)))
 
     if opt.energy:
         plan.append(("By Energy", _group(
@@ -442,7 +514,7 @@ def write_library(tree: ET.ElementTree, plan: Plan, folder_name: str, out_path: 
 
     organized = _folder(top, folder_name)
     for folder_title, lists in plan:
-        sub = _folder(organized, folder_title)
+        sub = organized if folder_title == TOP_LEVEL else _folder(organized, folder_title)
         for title, ids in lists:
             pl = ET.SubElement(sub, "NODE", Name=title, Type="1", KeyType="0",
                                Entries=str(len(ids)))
@@ -476,7 +548,13 @@ def apply_energy(tracks: list[Track], opt: Options, log: Callable[[str], None],
     """Analyse the audio, set Track.energy, and return {track id: new star rating}."""
     import energy   # needs numpy + an audio decoder; only loaded when used
 
-    features = energy.analyse_library({t.id: t.path for t in tracks if t.path}, log, progress)
+    # Prefer rekordbox's own analysis (works for every format, no decoding).
+    # Never mix the two sources: their measurements aren't on the same scale.
+    waveforms = {t.id: t.waveform for t in tracks if t.waveform}
+    if waveforms:
+        features = energy.analyse_waveforms(waveforms, log, progress)
+    else:
+        features = energy.analyse_library({t.id: t.path for t in tracks if t.path}, log, progress)
     levels = energy.levels_from_features(features, {t.id: t.bpm for t in tracks})
     ratings: dict[str, int] = {}
     counts = [0] * 6
@@ -507,10 +585,14 @@ def _organize(tracks: list[Track], opt: Options, log: Callable[[str], None],
 
     total = 0
     for folder, lists in plan:
-        if folder == CUSTOM_FOLDER:
-            log(f"  {folder}:")
+        if folder == TOP_LEVEL:
+            placed = sum(len(ids) for name, ids in lists if name != LEFTOVERS_NAME)
+            log(f"Sorted {placed} of {len(tracks)} tracks into your playlists:")
             for name, ids in lists:
                 log(f"    {name}: {len(ids)} track{'s' if len(ids) != 1 else ''}")
+            if placed < len(tracks) and not opt.custom_leftovers:
+                log(f"  The other {len(tracks) - placed} tracks didn't fit any playlist "
+                    "and were left alone.")
         else:
             log(f"  {folder}: {len(lists)} playlist{'s' if len(lists) != 1 else ''}")
         total += len(lists)

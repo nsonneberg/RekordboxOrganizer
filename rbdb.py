@@ -19,10 +19,11 @@ from uuid import uuid4
 # the pure-Python fallback is plenty fast for this.
 os.environ.setdefault("DISABLE_SQLALCHEMY_CEXT_RUNTIME", "1")
 
-from organizer import COLOUR_ORDER, Plan, Track, to_camelot   # noqa: E402
+from organizer import COLOUR_ORDER, TOP_LEVEL, Plan, Track, to_camelot   # noqa: E402
 
 KEEP_BACKUPS = 3
-SAMPLER_MARKER = "/PioneerDJ/Sampler/"
+# rekordbox's built-in sampler sounds (older and newer install locations)
+SAMPLER_MARKERS = ("/pioneerdj/sampler/", "/rekordbox/sampler/")
 
 
 def _pyrekordbox():
@@ -65,10 +66,14 @@ def load_tracks(db) -> tuple[list[Track], dict]:
     tracks, contents = [], {}
     query = db.query(models.DjmdContent).filter(models.DjmdContent.rb_local_deleted == 0)
     for c in query:
-        folder = (c.FolderPath or "").replace("\\", "/")
-        if SAMPLER_MARKER in folder:          # rekordbox's built-in sampler sounds
+        folder = (c.FolderPath or "").replace("\\", "/").casefold()
+        if any(marker in folder for marker in SAMPLER_MARKERS):
             continue
         colour = c.ColorName or ""
+        try:
+            waveform = str(db.get_anlz_paths(c).get("EXT") or "")
+        except Exception:    # no analysis yet
+            waveform = ""
         tracks.append(Track(
             id=str(c.ID),
             name=(c.Title or "").strip(),
@@ -83,6 +88,7 @@ def load_tracks(db) -> tuple[list[Track], dict]:
             date_added=c.StockDate or c.DateCreated or "",
             play_count=_int(c.DJPlayCount),
             path=os.path.normpath(c.FolderPath) if c.FolderPath else "",
+            waveform=waveform if waveform and os.path.exists(waveform) else "",
         ))
         contents[str(c.ID)] = c
     return tracks, contents
@@ -132,7 +138,7 @@ def write_changes(db, contents: dict, plan: Plan, folder_name: str,
 
         top = db.create_playlist_folder(folder_name)
         for folder_title, lists in plan:
-            sub = db.create_playlist_folder(folder_title, parent=top)
+            sub = top if folder_title == TOP_LEVEL else db.create_playlist_folder(folder_title, parent=top)
             for title, ids in lists:
                 pl = db.create_playlist(title, parent=sub)
                 now = datetime.datetime.now()

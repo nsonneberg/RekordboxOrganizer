@@ -52,10 +52,15 @@ class OrganizerTests(unittest.TestCase):
         self.assertEqual(organizer.to_camelot("F#"), "2B")
         self.assertEqual(organizer.to_camelot("nonsense"), "")
 
+    def test_defaults_make_nothing_extra(self):
+        _, tracks = organizer.load_library(self.path)
+        self.assertEqual(organizer.build_plan(tracks, organizer.Options()), [])
+
     def test_plan(self):
         _, tracks = organizer.load_library(self.path)
         plan = dict(organizer.build_plan(tracks, organizer.Options(
-            year=True, rating=True, colour=True, date_added=True, never_played=True)))
+            genre=True, bpm=True, key=True, year=True, rating=True, colour=True,
+            date_added=True, duplicates=True, missing_info=True, never_played=True)))
 
         self.assertEqual(plan["By Genre"],
                          [("Tech House", ["1", "2"]), ("Techno", ["4"]), ("No Genre", ["3"])])
@@ -89,33 +94,63 @@ class OrganizerTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 organizer.parse_range(bad)
 
-    def _custom(self, tracks, playlists, leftovers=True):
+    def _custom(self, tracks, playlists, leftovers=False):
         opt = organizer.Options(custom_enabled=True, custom_leftovers=leftovers,
                                 custom=[organizer.CustomPlaylist(*p) for p in playlists])
         return dict(organizer.sort_into_custom(tracks, organizer.compile_custom(opt), leftovers))
 
-    def test_custom_playlists_place_every_song_once(self):
+    @staticmethod
+    def _tracks(*specs):
+        """specs: (id, genre, bpm)"""
+        return [organizer.Track(tid, f"t{tid}", "a", genre, "", bpm, "", 0, 0, "", "", 0, "")
+                for tid, genre, bpm in specs]
+
+    def test_custom_playlists_never_overlap_and_ties_go_to_first(self):
         _, tracks = organizer.load_library(self.path)
         result = self._custom(tracks, [("House", "house", "120-130"),
                                        ("Anything House", "house"),
-                                       ("Fast", "", "135+")])
+                                       ("Fast", "", "135+")], leftovers=True)
         self.assertEqual(result["House"], ["1", "2"])
-        self.assertEqual(result["Anything House"], [])          # first match wins
+        self.assertEqual(result["Anything House"], [])          # same fit: higher row wins
         self.assertEqual(result["Fast"], ["4"])
         self.assertEqual(result["Everything Else"], ["3"])
         placed = [i for ids in result.values() for i in ids]
         self.assertEqual(sorted(placed), ["1", "2", "3", "4"])
 
-        no_rest = self._custom(tracks, [("Fast", "", "135+")], leftovers=False)
-        self.assertEqual(list(no_rest), ["Fast"])
+    def test_tracks_that_fit_nothing_are_left_alone(self):
+        _, tracks = organizer.load_library(self.path)
+        result = self._custom(tracks, [("Fast", "", "135+")])
+        self.assertEqual(result, {"Fast": ["4"]})
 
-    def test_custom_genre_words_match_whole_words(self):
-        mk = lambda tid, genre: organizer.Track(tid, "t", "a", genre, "", 0, "", 0, 0, "", "", 0, "")
-        tracks = [mk("1", "Trap"), mk("2", "Hip-Hop"), mk("3", "UK Rap"), mk("4", "Deep House")]
-        result = self._custom(tracks, [("Hip Hop", "hip hop, rap"), ("House", "HOUSE")])
-        self.assertEqual(result["Hip Hop"], ["2", "3"])
-        self.assertEqual(result["House"], ["4"])
-        self.assertEqual(result["Everything Else"], ["1"])
+    def test_genre_and_bpm_must_both_match(self):
+        tracks = self._tracks(("1", "Techno", 136), ("2", "Techno", 128), ("3", "House", 136),
+                              ("4", "Techno", 0))
+        result = self._custom(tracks, [("Techno", "techno", "130-145")])
+        self.assertEqual(result["Techno"], ["1"])                # 128 too slow, house wrong genre,
+                                                                 # unknown BPM can't be checked
+
+    def test_genre_matching_is_relaxed(self):
+        tracks = self._tracks(("1", "Progressive House", 128), ("2", "Tech-House", 126),
+                              ("3", "Deephouse", 122), ("4", "Drum & Bass", 174),
+                              ("5", "Hip-Hop/Rap", 90), ("6", "Trap", 140), ("7", "UK Rap", 92),
+                              ("9", "Dance & EDM", 128))
+        result = self._custom(tracks, [("House", "house"), ("DnB", "dnb"), ("Hip Hop", "hip hop")])
+        self.assertEqual(result["House"], ["3", "2", "1"])       # sorted by BPM
+        self.assertEqual(result["DnB"], ["4"])
+        self.assertEqual(result["Hip Hop"], ["5", "7", "6"])     # trap & rap are hip hop family
+
+    def test_rap_does_not_match_inside_other_words(self):
+        tracks = self._tracks(("1", "Grapefruit Pop", 100), ("2", "Rap", 90))
+        self.assertEqual(self._custom(tracks, [("Rap", "rap")]), {"Rap": ["2"]})
+
+    def test_best_genre_fit_wins_over_list_order(self):
+        tracks = self._tracks(("1", "Melodic House & Techno", 124), ("2", "House", 124),
+                              ("3", "Techno", 124), ("4", "Hip Hop", 124))
+        result = self._custom(tracks, [("House", "house"), ("Techno", "techno"),
+                                       ("Anything 124", "", "120-130")])
+        self.assertEqual(result["House"], ["2"])
+        self.assertEqual(result["Techno"], ["1", "3"])           # main genre is the last word
+        self.assertEqual(result["Anything 124"], ["4"])          # genre rows beat no-genre rows
 
     def test_custom_energy_rule(self):
         _, tracks = organizer.load_library(self.path)
@@ -126,18 +161,36 @@ class OrganizerTests(unittest.TestCase):
         self.assertTrue(organizer.rules_need_energy(organizer.compile_custom(organizer.Options(
             custom_enabled=True, custom=[organizer.CustomPlaylist("Peak", energy="4+")]))))
 
+    def test_full_energy_range_means_any(self):
+        rules = organizer.compile_custom(organizer.Options(custom_enabled=True, custom=[
+            organizer.CustomPlaylist("House", "house", "", "1-5")]))
+        self.assertFalse(organizer.rules_need_energy(rules))
+        tracks = self._tracks(("1", "House", 0))                 # energy unknown
+        self.assertEqual(organizer.sort_into_custom(tracks, rules, False), [("House", ["1"])])
+
     def test_custom_validation_messages(self):
         for playlist, text in ((organizer.CustomPlaylist("Fast", bpm="quick"), "BPM 'quick'"),
-                               (organizer.CustomPlaylist("Hot", energy="9"), "1 to 5")):
+                               (organizer.CustomPlaylist("Hot", energy="9"), "1 to 5"),
+                               (organizer.CustomPlaylist("Empty"), "has no rules"),
+                               (organizer.CustomPlaylist("Any", energy="1-5"), "has no rules")):
             with self.assertRaises(ValueError) as ctx:
                 organizer.compile_custom(organizer.Options(custom_enabled=True, custom=[playlist]))
             self.assertIn(text, str(ctx.exception))
         self.assertEqual(organizer.compile_custom(organizer.Options(
             custom=[organizer.CustomPlaylist("x", bpm="bad")])), [])   # disabled: not checked
 
+    def test_custom_playlists_sit_directly_in_main_folder(self):
+        opt = organizer.Options(custom_enabled=True,
+                                custom=[organizer.CustomPlaylist("Techno", "techno")])
+        out = organizer.run(opt, self.path, log=lambda m: None)
+        organized = ET.parse(out).getroot().find("PLAYLISTS/NODE/NODE[@Name='Organized']")
+        self.assertEqual([(n.get("Name"), n.get("Type")) for n in organized], [("Techno", "1")])
+        self.assertEqual([t.get("Key") for t in organized.find("NODE")], ["4"])
+
     def test_run_writes_importable_xml_and_is_rerunnable(self):
-        first_out = organizer.run(organizer.Options(), self.path, log=lambda m: None)
-        out = organizer.run(organizer.Options(), first_out, log=lambda m: None)  # re-run on own output
+        opt = organizer.Options(genre=True)
+        first_out = organizer.run(opt, self.path, log=lambda m: None)
+        out = organizer.run(opt, first_out, log=lambda m: None)  # re-run on own output
         self.addCleanup(os.remove, out)
 
         root = ET.parse(out).getroot()

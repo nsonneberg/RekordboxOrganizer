@@ -1,7 +1,8 @@
 """Listen to tracks and score their energy on a 1-5 scale.
 
-Each track is decoded and measured for loudness, rhythmic activity (spectral
-flux), brightness and high-frequency (hi-hat / percussion) content. Those
+Each track is measured for loudness, rhythmic activity (flux), brightness and
+high-frequency (hi-hat / percussion) content, either from rekordbox's own colour
+waveform (direct mode, no decoding) or by decoding the audio file. Those
 measurements, plus BPM, are combined into one score per track. Scores are then
 ranked against the rest of the library: 1 = calmest 20%, 5 = most energetic 20%.
 
@@ -124,6 +125,70 @@ def measure(samples: np.ndarray, sr: int) -> dict:
 def analyse_file(path: str) -> dict:
     samples, sr = decode(path)
     return measure(samples, sr)
+
+
+# --------------------------------------------------------------------------- #
+# rekordbox waveforms (no audio decoding needed)
+# --------------------------------------------------------------------------- #
+
+def read_waveform(ext_path: str) -> np.ndarray:
+    """Return the colour waveform (PWV5 tag) from a rekordbox ANLZ .EXT file.
+
+    150 entries per second; each 16-bit entry packs red (lows), green (mids),
+    blue (highs) as 3 bits each, plus a 5-bit height.
+    """
+    with open(ext_path, "rb") as f:
+        data = f.read()
+    if data[:4] != b"PMAI":
+        raise ValueError("not a rekordbox analysis file")
+    pos = int.from_bytes(data[4:8], "big")
+    while pos + 12 <= len(data):
+        kind = data[pos:pos + 4]
+        len_header = int.from_bytes(data[pos + 4:pos + 8], "big")
+        len_tag = int.from_bytes(data[pos + 8:pos + 12], "big")
+        if kind == b"PWV5":
+            n = int.from_bytes(data[pos + 16:pos + 20], "big")
+            return np.frombuffer(data, ">u2", count=n, offset=pos + len_header).astype(np.int32)
+        if len_tag <= 0:
+            break
+        pos += len_tag
+    raise ValueError("no colour waveform in analysis file")
+
+
+def measure_waveform(entries: np.ndarray) -> dict:
+    height = ((entries >> 2) & 0x1F).astype(float)
+    low = ((entries >> 13) & 7).astype(float)
+    mid = ((entries >> 10) & 7).astype(float)
+    high = ((entries >> 7) & 7).astype(float)
+    sounding = height > 0
+    if sounding.sum() < 150:
+        raise ValueError("waveform too short")
+    body = sounding & (height >= np.median(height[sounding]))   # skip intros / breakdowns
+    total = low + mid + high + 1e-9
+    flux = np.maximum(np.diff(height, prepend=height[0]), 0)
+    return {
+        "loudness": float(height[body].mean()),
+        "flux": float(flux[body].mean()),
+        "brightness": float(((mid + 2 * high) / total)[body].mean()),
+        "highs": float((high / total)[body].mean()),
+    }
+
+
+def analyse_waveforms(paths: dict[str, str], log: Callable[[str], None] = print,
+                      progress: Optional[Callable[[int, int], None]] = None) -> dict[str, dict]:
+    """Measure tracks from rekordbox's own analysis. paths = {track id: .EXT path}."""
+    log(f"Energy: reading rekordbox's analysis of {len(paths)} tracks ...")
+    results, failures = {}, 0
+    for n, (tid, path) in enumerate(paths.items(), 1):
+        try:
+            results[tid] = measure_waveform(read_waveform(path))
+        except (OSError, ValueError):
+            failures += 1
+        if progress:
+            progress(n, len(paths))
+    if failures:
+        log(f"  {failures} tracks have no usable analysis (analyse them in rekordbox first).")
+    return results
 
 
 # --------------------------------------------------------------------------- #
