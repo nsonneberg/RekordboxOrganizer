@@ -78,9 +78,66 @@ class OrganizerTests(unittest.TestCase):
         plan = dict(organizer.build_plan(tracks, organizer.Options(artist=True, min_tracks=2)))
         self.assertEqual([n for n, _ in plan["By Artist"]], ["DJ One", "Other"])
 
+    def test_parse_range(self):
+        self.assertEqual(organizer.parse_range(""), (None, None))
+        self.assertEqual(organizer.parse_range(" Any "), (None, None))
+        self.assertEqual(organizer.parse_range("120-126"), (120, 126))
+        self.assertEqual(organizer.parse_range("126 - 120"), (120, 126))
+        self.assertEqual(organizer.parse_range("128+"), (128, None))
+        self.assertEqual(organizer.parse_range("174"), (174, 174))
+        for bad in ("fast", "1-2-3", "12.5"):
+            with self.assertRaises(ValueError):
+                organizer.parse_range(bad)
+
+    def _custom(self, tracks, playlists, leftovers=True):
+        opt = organizer.Options(custom_enabled=True, custom_leftovers=leftovers,
+                                custom=[organizer.CustomPlaylist(*p) for p in playlists])
+        return dict(organizer.sort_into_custom(tracks, organizer.compile_custom(opt), leftovers))
+
+    def test_custom_playlists_place_every_song_once(self):
+        _, tracks = organizer.load_library(self.path)
+        result = self._custom(tracks, [("House", "house", "120-130"),
+                                       ("Anything House", "house"),
+                                       ("Fast", "", "135+")])
+        self.assertEqual(result["House"], ["1", "2"])
+        self.assertEqual(result["Anything House"], [])          # first match wins
+        self.assertEqual(result["Fast"], ["4"])
+        self.assertEqual(result["Everything Else"], ["3"])
+        placed = [i for ids in result.values() for i in ids]
+        self.assertEqual(sorted(placed), ["1", "2", "3", "4"])
+
+        no_rest = self._custom(tracks, [("Fast", "", "135+")], leftovers=False)
+        self.assertEqual(list(no_rest), ["Fast"])
+
+    def test_custom_genre_words_match_whole_words(self):
+        mk = lambda tid, genre: organizer.Track(tid, "t", "a", genre, "", 0, "", 0, 0, "", "", 0, "")
+        tracks = [mk("1", "Trap"), mk("2", "Hip-Hop"), mk("3", "UK Rap"), mk("4", "Deep House")]
+        result = self._custom(tracks, [("Hip Hop", "hip hop, rap"), ("House", "HOUSE")])
+        self.assertEqual(result["Hip Hop"], ["2", "3"])
+        self.assertEqual(result["House"], ["4"])
+        self.assertEqual(result["Everything Else"], ["1"])
+
+    def test_custom_energy_rule(self):
+        _, tracks = organizer.load_library(self.path)
+        for t, e in zip(tracks, [5, 2, 0, 4]):
+            t.energy = e
+        result = self._custom(tracks, [("Peak", "", "", "4-5")])
+        self.assertEqual(result["Peak"], ["1", "4"])
+        self.assertTrue(organizer.rules_need_energy(organizer.compile_custom(organizer.Options(
+            custom_enabled=True, custom=[organizer.CustomPlaylist("Peak", energy="4+")]))))
+
+    def test_custom_validation_messages(self):
+        for playlist, text in ((organizer.CustomPlaylist("Fast", bpm="quick"), "BPM 'quick'"),
+                               (organizer.CustomPlaylist("Hot", energy="9"), "1 to 5")):
+            with self.assertRaises(ValueError) as ctx:
+                organizer.compile_custom(organizer.Options(custom_enabled=True, custom=[playlist]))
+            self.assertIn(text, str(ctx.exception))
+        self.assertEqual(organizer.compile_custom(organizer.Options(
+            custom=[organizer.CustomPlaylist("x", bpm="bad")])), [])   # disabled: not checked
+
     def test_run_writes_importable_xml_and_is_rerunnable(self):
-        first_out = organizer.run(self.path, organizer.Options(), log=lambda m: None)
-        out = organizer.run(first_out, organizer.Options(), log=lambda m: None)  # re-run on own output
+        first_out = organizer.run(organizer.Options(), self.path, log=lambda m: None)
+        out = organizer.run(organizer.Options(), first_out, log=lambda m: None)  # re-run on own output
         self.addCleanup(os.remove, out)
 
         root = ET.parse(out).getroot()

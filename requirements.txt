@@ -1,0 +1,4 @@
+numpy>=1.24
+soundfile>=0.12      # decodes MP3, WAV, AIFF, FLAC, OGG
+av>=12               # optional: adds M4A/AAC/ALAC decoding (skipped if it won't load)
+pyrekordbox>=0.5,<0.6

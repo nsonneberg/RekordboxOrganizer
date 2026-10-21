@@ -4,3 +4,4 @@ dist/
 *.spec
 *_organized.xml
 .cursor/
+.venv/

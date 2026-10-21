@@ -1,8 +1,8 @@
-"""Core logic: read a rekordbox XML export, build organized playlists, write a new XML.
+"""Core logic: read a rekordbox library, build organized playlists, write them back.
 
-The music files themselves are never touched. The output is a rekordbox XML file
-containing the full collection plus a new playlist folder that can be imported
-back into rekordbox.
+The library comes either straight from rekordbox's database (see rbdb.py) or
+from an XML export. With an XML export the output is a new XML file to import
+back into rekordbox. The music files themselves are never modified.
 """
 
 from __future__ import annotations
@@ -11,7 +11,8 @@ import os
 import re
 import xml.etree.ElementTree as ET
 from collections import defaultdict
-from dataclasses import dataclass
+import sys
+from dataclasses import dataclass, field
 from typing import Callable, Optional
 from urllib.parse import unquote, urlparse
 
@@ -43,7 +44,9 @@ _COLOURS = {
     "0XFFFF00": "Yellow", "0X00FF00": "Green", "0X25FDE9": "Aqua",
     "0X0000FF": "Blue", "0X660099": "Purple",
 }
-_COLOUR_ORDER = ["Pink", "Red", "Orange", "Yellow", "Green", "Aqua", "Blue", "Purple"]
+COLOUR_ORDER = ["Pink", "Red", "Orange", "Yellow", "Green", "Aqua", "Blue", "Purple"]
+
+ENERGY_NAMES = {1: "Chill", 2: "Warm-up", 3: "Groove", 4: "Driving", 5: "Peak Time"}
 
 
 # --------------------------------------------------------------------------- #
@@ -65,10 +68,26 @@ class Track:
     date_added: str   # "YYYY-MM-DD"
     play_count: int
     path: str         # local file path decoded from Location
+    energy: int = 0   # 1-5 once analysed, 0 if unknown
+
+
+@dataclass
+class CustomPlaylist:
+    """A playlist the user names, with optional rules. Empty rule = matches anything."""
+    name: str
+    genres: str = ""   # comma-separated words, e.g. "hip hop, rap"
+    bpm: str = ""      # e.g. "120-126", "128+", "174"
+    energy: str = ""   # e.g. "4-5", "3"
 
 
 @dataclass
 class Options:
+    custom_enabled: bool = False   # sort the library into the user's own playlists
+    custom: list[CustomPlaylist] = field(default_factory=list)
+    custom_leftovers: bool = True  # songs matching no rule go to "Everything Else"
+    energy: bool = False         # listen to the music and score energy 1-5
+    energy_ratings: bool = True  # ...and set the star rating to the energy level
+    keep_ratings: bool = True    # ...except on tracks that already have a rating
     genre: bool = True
     bpm: bool = True
     bpm_step: int = 5
@@ -204,8 +223,104 @@ def _norm_title(s: str) -> str:
     return " ".join(s.split())
 
 
-def build_plan(tracks: list[Track], opt: Options) -> Plan:
+LEFTOVERS_NAME = "Everything Else"
+CUSTOM_FOLDER = "My Playlists"
+
+
+def _words(text: str) -> str:
+    """Lowercase, punctuation to spaces, padded: ' hip hop ' (for whole-word matching)."""
+    return " " + " ".join(re.sub(r"[^\w]+", " ", text.casefold()).split()) + " "
+
+
+def parse_range(text: str) -> tuple[Optional[int], Optional[int]]:
+    """'' / 'any' -> (None, None); '120-126'; '128+'; '174' -> (174, 174)."""
+    t = text.strip().lower().replace(" ", "")
+    if t in ("", "any", "*"):
+        return (None, None)
+    m = re.fullmatch(r"(\d+)(?:-(\d+)|(\+))?", t)
+    if not m:
+        raise ValueError(text)
+    lo = int(m.group(1))
+    if m.group(3):
+        return (lo, None)
+    hi = int(m.group(2)) if m.group(2) else lo
+    return (min(lo, hi), max(lo, hi))
+
+
+@dataclass
+class _Rule:
+    name: str
+    words: list[str]
+    bpm: tuple[Optional[int], Optional[int]]
+    energy: tuple[Optional[int], Optional[int]]
+
+    def matches(self, t: Track) -> bool:
+        if self.words and not any(w in _words(t.genre) for w in self.words):
+            return False
+        for value, (lo, hi) in ((round(t.bpm), self.bpm), (t.energy, self.energy)):
+            if lo is None and hi is None:
+                continue
+            if value <= 0 or (lo is not None and value < lo) or (hi is not None and value > hi):
+                return False
+        return True
+
+
+def compile_custom(opt: Options) -> list[_Rule]:
+    """Validate the user's playlists. Raises ValueError with a friendly message."""
+    if not opt.custom_enabled:
+        return []
+    rules = []
+    for i, cp in enumerate(opt.custom, 1):
+        name = cp.name.strip() or f"Playlist {i}"
+        try:
+            bpm = parse_range(cp.bpm)
+        except ValueError:
+            raise ValueError(f"Playlist '{name}': BPM '{cp.bpm}' isn't a valid range. "
+                             "Try 120-126, 128+ or 174, or leave it empty.") from None
+        try:
+            energy = parse_range(cp.energy)
+        except ValueError:
+            raise ValueError(f"Playlist '{name}': energy '{cp.energy}' isn't valid. "
+                             "Try 4-5, 3+ or 2, or leave it empty.") from None
+        if any(v is not None and not 1 <= v <= 5 for v in energy):
+            raise ValueError(f"Playlist '{name}': energy goes from 1 to 5.")
+        words = [_words(w) for w in cp.genres.split(",") if w.strip()]
+        rules.append(_Rule(name, words, bpm, energy))
+    return rules
+
+
+def rules_need_energy(rules: list[_Rule]) -> bool:
+    return any(r.energy != (None, None) for r in rules)
+
+
+def sort_into_custom(tracks: list[Track], rules: list[_Rule], leftovers: bool):
+    """Each track goes into the first playlist it matches. Returns [(name, [ids])]."""
+    lists: list[tuple[str, list[str]]] = [(r.name, []) for r in rules]
+    rest: list[str] = []
+    for t in sorted(tracks, key=lambda t: (t.bpm, t.artist.casefold(), t.name.casefold())):
+        for rule, (_, ids) in zip(rules, lists):
+            if rule.matches(t):
+                ids.append(t.id)
+                break
+        else:
+            rest.append(t.id)
+    if leftovers and rest:
+        lists.append((LEFTOVERS_NAME, rest))
+    return lists
+
+
+def build_plan(tracks: list[Track], opt: Options, rules: Optional[list[_Rule]] = None) -> Plan:
     plan: Plan = []
+
+    if rules is None:
+        rules = compile_custom(opt)
+    if rules:
+        plan.append((CUSTOM_FOLDER, sort_into_custom(tracks, rules, opt.custom_leftovers)))
+
+    if opt.energy:
+        plan.append(("By Energy", _group(
+            tracks, lambda t: (t.energy, f"{t.energy} - {ENERGY_NAMES[t.energy]}")
+            if t.energy else None)))
 
     if opt.genre:
         plan.append(("By Genre", _group(
@@ -250,7 +365,7 @@ def build_plan(tracks: list[Track], opt: Options) -> Plan:
 
     if opt.colour:
         plan.append(("By Color", _group(
-            tracks, lambda t: (_COLOUR_ORDER.index(t.colour), t.colour) if t.colour else None)))
+            tracks, lambda t: (COLOUR_ORDER.index(t.colour), t.colour) if t.colour else None)))
 
     if opt.date_added:
         def month_key(t):
@@ -303,8 +418,16 @@ def _set_count(folder: ET.Element) -> None:
     folder.set("Count", str(len(folder.findall("NODE"))))
 
 
-def write_library(tree: ET.ElementTree, plan: Plan, folder_name: str, out_path: str) -> None:
+def write_library(tree: ET.ElementTree, plan: Plan, folder_name: str, out_path: str,
+                  ratings: Optional[dict[str, int]] = None) -> None:
     root = tree.getroot()
+    if ratings:
+        for el in root.iterfind("COLLECTION/TRACK"):
+            stars = ratings.get(el.get("TrackID", ""))
+            if stars is not None:
+                el.set("Rating", str(stars * 51))
+
+
     playlists = root.find("PLAYLISTS")
     if playlists is None:
         playlists = ET.SubElement(root, "PLAYLISTS")
@@ -332,29 +455,108 @@ def write_library(tree: ET.ElementTree, plan: Plan, folder_name: str, out_path: 
     tree.write(out_path, encoding="UTF-8", xml_declaration=True)
 
 
+def app_data_dir() -> str:
+    """Per-user folder for the energy cache and saved settings."""
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    elif sys.platform == "darwin":
+        base = os.path.expanduser("~/Library/Application Support")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "RekordboxOrganizer")
+
+
 def default_output_path(xml_path: str) -> str:
     base, _ = os.path.splitext(xml_path)
     return base + "_organized.xml"
 
 
-def run(xml_path: str, opt: Options, log: Callable[[str], None] = print) -> str:
-    """Do the whole job. Returns the path of the written XML file."""
-    log(f"Reading {os.path.basename(xml_path)} ...")
-    tree, tracks = load_library(xml_path)
-    log(f"Found {len(tracks)} tracks.")
-    if not tracks:
-        raise ValueError("The collection in this XML file is empty.")
+def apply_energy(tracks: list[Track], opt: Options, log: Callable[[str], None],
+                 progress: Optional[Callable[[int, int], None]] = None) -> dict[str, int]:
+    """Analyse the audio, set Track.energy, and return {track id: new star rating}."""
+    import energy   # needs numpy + an audio decoder; only loaded when used
 
-    plan = build_plan(tracks, opt)
-    if not plan:
-        raise ValueError("Nothing to create - tick at least one option.")
+    features = energy.analyse_library({t.id: t.path for t in tracks if t.path}, log, progress)
+    levels = energy.levels_from_features(features, {t.id: t.bpm for t in tracks})
+    ratings: dict[str, int] = {}
+    counts = [0] * 6
+    for t in tracks:
+        level = levels.get(t.id, 0)
+        t.energy = level
+        counts[level] += 1
+        if level and opt.energy and opt.energy_ratings and not (opt.keep_ratings and t.rating):
+            t.rating = level
+            ratings[t.id] = level
+    log("Energy levels: " + ", ".join(f"{i}: {counts[i]}" for i in range(1, 6))
+        + (f" ({counts[0]} not analysed)" if counts[0] else ""))
+    return ratings
+
+
+def _organize(tracks: list[Track], opt: Options, log: Callable[[str], None],
+              progress: Optional[Callable[[int, int], None]]) -> tuple[Plan, dict[str, int], int]:
+    """Shared by both modes: (plan, new star ratings, number of playlists)."""
+    rules = compile_custom(opt)          # validate before any slow work
+    ratings: dict[str, int] = {}
+    if opt.energy or rules_need_energy(rules):
+        if not opt.energy:
+            log("Your playlist rules use energy, so the app will listen to your music.")
+        ratings = apply_energy(tracks, opt, log, progress)
+    plan = build_plan(tracks, opt, rules)
+    if not plan and not ratings:
+        raise ValueError("Nothing to do - tick at least one option.")
+
     total = 0
     for folder, lists in plan:
-        log(f"  {folder}: {len(lists)} playlist{'s' if len(lists) != 1 else ''}")
+        if folder == CUSTOM_FOLDER:
+            log(f"  {folder}:")
+            for name, ids in lists:
+                log(f"    {name}: {len(ids)} track{'s' if len(ids) != 1 else ''}")
+        else:
+            log(f"  {folder}: {len(lists)} playlist{'s' if len(lists) != 1 else ''}")
         total += len(lists)
+    return plan, ratings, total
 
-    out_path = default_output_path(xml_path)
-    write_library(tree, plan, opt.folder_name.strip() or "Organized", out_path)
-    log(f"Created {total} playlists.")
-    log(f"Saved: {out_path}")
-    return out_path
+
+def run(opt: Options, xml_path: Optional[str] = None, log: Callable[[str], None] = print,
+        progress: Optional[Callable[[int, int], None]] = None) -> str:
+    """Do the whole job.
+
+    With xml_path, reads that export and writes a new XML next to it; returns its path.
+    Without, works directly on rekordbox's database; returns the database path.
+    """
+    folder_name = opt.folder_name.strip() or "Organized"
+    if xml_path:
+        log(f"Reading {os.path.basename(xml_path)} ...")
+        tree, tracks = load_library(xml_path)
+        log(f"Found {len(tracks)} tracks.")
+        if not tracks:
+            raise ValueError("The collection in this XML file is empty.")
+        plan, ratings, total = _organize(tracks, opt, log, progress)
+        out_path = default_output_path(xml_path)
+        write_library(tree, plan, folder_name, out_path, ratings)
+        log(f"Created {total} playlists.")
+        log(f"Saved: {out_path}")
+        return out_path
+
+    import rbdb
+    if rbdb.rekordbox_running():
+        raise ValueError("rekordbox is open. Please close it first, then press Run again.")
+    log("Opening your rekordbox library ...")
+    db = rbdb.open_database()
+    try:
+        db_path = rbdb.database_path(db)
+        tracks, contents = rbdb.load_tracks(db)
+        log(f"Found {len(tracks)} tracks.")
+        if not tracks:
+            raise ValueError("Your rekordbox collection is empty.")
+        plan, ratings, total = _organize(tracks, opt, log, progress)
+
+        if rbdb.rekordbox_running():
+            raise ValueError("rekordbox was opened while working. Nothing was changed - "
+                             "close rekordbox and press Run again.")
+        log(f"Backed up your library to {os.path.basename(rbdb.backup(db_path))}")
+        rbdb.write_changes(db, contents, plan, folder_name, ratings, log)
+        log(f"Created {total} playlists in rekordbox.")
+        return db_path
+    finally:
+        db.close()
