@@ -14,7 +14,7 @@ You don't need Python or anything else. The app is a single download.
 
 ### Get the download
 
-Sign in to GitHub, then download the newest version for your computer:
+Download the newest version for your computer:
 
 - **Windows 10 / 11:** [Rekordbox-Organizer-Windows.exe](../../releases/latest/download/Rekordbox-Organizer-Windows.exe)
 - **Mac with Apple Silicon (M1 or newer):** [Rekordbox-Organizer-macOS.zip](../../releases/latest/download/Rekordbox-Organizer-macOS.zip)
