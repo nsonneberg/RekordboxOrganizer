@@ -19,7 +19,7 @@ from uuid import uuid4
 # the pure-Python fallback is plenty fast for this.
 os.environ.setdefault("DISABLE_SQLALCHEMY_CEXT_RUNTIME", "1")
 
-from organizer import COLOUR_ORDER, TOP_LEVEL, Plan, Track, to_camelot   # noqa: E402
+from organizer import COLOUR_ORDER, Plan, Track, folder_path, to_camelot   # noqa: E402
 
 KEEP_BACKUPS = 3
 # rekordbox's built-in sampler sounds (older and newer install locations)
@@ -136,9 +136,15 @@ def write_changes(db, contents: dict, plan: Plan, folder_name: str,
                 db.delete_playlist(old)
         db.flush()
 
-        top = db.create_playlist_folder(folder_name)
+        folders = {(): db.create_playlist_folder(folder_name)}
+
+        def folder_for(path: tuple):
+            if path not in folders:
+                folders[path] = db.create_playlist_folder(path[-1], parent=folder_for(path[:-1]))
+            return folders[path]
+
         for folder_title, lists in plan:
-            sub = top if folder_title == TOP_LEVEL else db.create_playlist_folder(folder_title, parent=top)
+            sub = folder_for(folder_path(folder_title))
             for title, ids in lists:
                 pl = db.create_playlist(title, parent=sub)
                 now = datetime.datetime.now()

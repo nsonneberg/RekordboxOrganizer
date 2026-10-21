@@ -23,8 +23,9 @@ from typing import Callable, Optional
 
 import numpy as np
 
-CACHE_VERSION = 1
-FEATURES = ("loudness", "flux", "brightness", "highs")
+CACHE_VERSION = 2   # 2: added 'lows'
+FEATURES = ("loudness", "flux", "brightness", "highs")   # used for energy
+# Measurements also include "lows" (bass share), used for genre detection.
 WEIGHTS = {"loudness": 0.30, "flux": 0.30, "highs": 0.15, "brightness": 0.10, "bpm": 0.15}
 
 MAX_SECONDS = 420      # analyse at most 7 minutes of each track
@@ -119,6 +120,7 @@ def measure(samples: np.ndarray, sr: int) -> dict:
         "flux": float(flux[body].mean()),
         "brightness": float(((power * freqs).sum(axis=1) / total)[body].mean()),
         "highs": float((power[:, freqs >= 5000].sum(axis=1) / total)[body].mean()),
+        "lows": float((power[:, freqs < 150].sum(axis=1) / total)[body].mean()),
     }
 
 
@@ -171,6 +173,7 @@ def measure_waveform(entries: np.ndarray) -> dict:
         "flux": float(flux[body].mean()),
         "brightness": float(((mid + 2 * high) / total)[body].mean()),
         "highs": float((high / total)[body].mean()),
+        "lows": float((low / total)[body].mean()),
     }
 
 

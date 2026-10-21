@@ -110,7 +110,8 @@ class App(ttk.Frame):
         self.folder_name = tk.StringVar(value="Organized")
         defaults = organizer.Options(custom_enabled=True)
         self.vars = {name: tk.BooleanVar(value=getattr(defaults, name)) for name in (
-            "custom_enabled", "custom_leftovers", "energy", "energy_ratings", "keep_ratings",
+            "custom_enabled", "custom_leftovers", "guess_genres", "auto_genres",
+            "energy", "energy_ratings", "keep_ratings",
             "genre", "bpm", "key", "artist", "label", "year", "rating", "colour",
             "date_added", "duplicates", "missing_files", "missing_info", "never_played")}
         self.bpm_step = tk.IntVar(value=defaults.bpm_step)
@@ -159,23 +160,38 @@ class App(ttk.Frame):
             cb.grid(row=row, column=col, sticky="w", pady=2, **kw)
             return cb
 
-        # Step 2 - energy
-        step2 = ttk.LabelFrame(self, text=" 2. Energy ", padding=10)
-        step2.grid(sticky="ew", pady=(12, 0))
-        check(step2, "energy", "Listen to my music and rate its energy 1-5", 0, 0)
+        # Steps 2 and 3 side by side
+        middle = ttk.Frame(self)
+        middle.grid(sticky="ew", pady=(12, 0))
+        middle.columnconfigure(0, weight=1, uniform="half")
+        middle.columnconfigure(1, weight=1, uniform="half")
+
+        step2 = ttk.LabelFrame(middle, text=" 2. Energy ", padding=10)
+        step2.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        check(step2, "energy", "Rate each song's energy 1-5", 0, 0)
         self.energy_ratings_cb = check(step2, "energy_ratings",
-                                       "Set each track's star rating to its energy level",
+                                       "Set its star rating to the energy level",
                                        1, 0, padx=(22, 0))
         self.keep_ratings_cb = check(step2, "keep_ratings",
-                                     "Don't change tracks I've already rated",
+                                     "Keep ratings I've already set",
                                      2, 0, padx=(44, 0))
         ttk.Label(step2, foreground="gray",
-                  text="1 = calmest 20% of your library, 5 = most energetic 20%. Straight from "
-                       "rekordbox it uses rekordbox's own track analysis, so it's quick.",
-                  wraplength=540, justify="left").grid(row=3, column=0, sticky="w", pady=(4, 0))
+                  text="1 = calmest 20% of your library, 5 = most energetic 20%. Uses "
+                       "rekordbox's own track analysis.",
+                  wraplength=360, justify="left").grid(row=3, column=0, sticky="w", pady=(4, 0))
 
-        # Step 3 - playlists (tabs)
-        ttk.Label(self, text="3. Playlists", font=("", 10, "bold")).grid(sticky="w", pady=(12, 2))
+        step3 = ttk.LabelFrame(middle, text=" 3. Genres ", padding=10)
+        step3.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        check(step3, "guess_genres", "Guess genres for untagged / vague songs", 0, 0)
+        check(step3, "auto_genres", "Auto genre detection (a folder per genre)", 1, 0)
+        ttk.Label(step3, foreground="gray", wraplength=360, justify="left",
+                  text="rekordbox doesn't detect genre, so guesses are estimates from BPM and "
+                       "sound, learned from your tagged songs. Guessed songs go in "
+                       "'(detected)' playlists so you can check them."
+                  ).grid(row=2, column=0, sticky="w", pady=(4, 0))
+
+        # Step 4 - playlists (tabs)
+        ttk.Label(self, text="4. Playlists", font=("", 10, "bold")).grid(sticky="w", pady=(12, 2))
         tabs = ttk.Notebook(self)
         tabs.grid(sticky="ew")
         tabs.add(self._build_custom_tab(tabs, check), text="  My playlists  ")
@@ -194,7 +210,7 @@ class App(ttk.Frame):
         self.progress.grid(sticky="ew", pady=(10, 0))
 
         # Log
-        self.log_box = tk.Text(self, height=7, wrap="word", state="disabled",
+        self.log_box = tk.Text(self, height=6, wrap="word", state="disabled",
                                relief="flat", borderwidth=1, highlightthickness=1)
         self.log_box.grid(sticky="nsew", pady=(10, 0))
         self.rowconfigure(self.log_box.grid_info()["row"], weight=1)
@@ -215,7 +231,7 @@ class App(ttk.Frame):
                                       textvariable=self.playlist_count)
         self.count_spin.pack(side="left", padx=(4, 0))
 
-        self.rows_frame = ScrollFrame(tab, height=150)
+        self.rows_frame = ScrollFrame(tab, height=120)
         self.rows_frame.grid(sticky="ew", pady=(8, 0))
         self.rows_frame.sync_background(ttk.Style())
         inner = self.rows_frame.inner
@@ -228,10 +244,11 @@ class App(ttk.Frame):
         self.leftovers_cb = check(tab, "custom_leftovers",
                                   f"Also make an '{organizer.LEFTOVERS_NAME}' playlist for songs "
                                   "that fit nowhere", 2, 0)
-        ttk.Label(tab, foreground="gray", wraplength=540, justify="left",
+        ttk.Label(tab, foreground="gray", wraplength=760, justify="left",
                   text="A song is added only if it matches every rule you fill in; songs that "
                        "don't fit are left alone. Genre is relaxed: 'house' also catches "
-                       "Progressive House, Tech-House, Deep House... If a song fits several "
+                       "Progressive House, Tech-House, Deep House... and, with guessing on, "
+                       "untagged songs that sound like house. If a song fits several "
                        "playlists it goes to the best genre match. "
                        "BPM: 120-126, 128+ or 174. Energy (1-5): 4-5, 3+ or 2."
                   ).grid(row=3, column=0, sticky="w", pady=(4, 0))

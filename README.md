@@ -32,8 +32,37 @@ give it rules:
 - Your playlists go straight into the main folder (named "Organized" by default), and
   your setup is saved between runs.
 
-Songs without a genre tag can't match a genre rule. Tag them in rekordbox first, or use
-BPM/energy-only playlists for them.
+**Genre guessing:** rekordbox's analysis doesn't include genre. It measures BPM, key and
+a colour waveform (loudness plus bass, mid and treble). For songs with no genre tag, or a
+vague one like "Electronic" or "Dance & EDM", the app estimates the genre from those
+measurements:
+
+1. **Learned from your library.** Songs with a clear genre tag are used as examples.
+   Each untagged song gets the genre of the tagged songs it sounds most like (BPM,
+   bass, brightness, punch, loudness). This needs at least 6 tagged songs across 2 or
+   more genres. The more you tag, the better it gets.
+2. **BPM and sound rules** otherwise, for example 160–185 BPM → Drum & Bass and
+   118–135 → House. In the 136–155 range it only names Dubstep, Techno or Trance on a
+   clear signal; otherwise it says EDM.
+
+Your own playlists use these guesses, so a "Dance & EDM" track at 125 BPM can land in
+your House playlist. Turn guessing off to match on tags only.
+
+**Auto genre detection:** makes an **Auto Genres** folder with a folder for every genre
+family found in your library (House, Techno, Drum & Bass, Hip Hop…). Tags that fit no
+known family get their own folder. Every song is sorted into one family:
+
+```
+Organized
+└─ Auto Genres
+   ├─ House
+   │  ├─ All House
+   │  ├─ House
+   │  ├─ Progressive House
+   │  └─ House (detected)      ← guessed songs, kept apart so you can check them
+   ├─ Drum & Bass
+   └─ Unknown Genre            ← no tag and no analysis to guess from
+```
 
 **Energy:** measures each track's loudness, rhythmic activity, brightness,
 hi-hat/percussion content and BPM. Working straight from rekordbox, it reads the colour

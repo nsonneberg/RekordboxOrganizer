@@ -87,10 +87,10 @@ class OrganizerTests(unittest.TestCase):
         self.assertEqual(organizer.parse_range(""), (None, None))
         self.assertEqual(organizer.parse_range(" Any "), (None, None))
         self.assertEqual(organizer.parse_range("120-126"), (120, 126))
-        self.assertEqual(organizer.parse_range("126 - 120"), (120, 126))
+        self.assertEqual(organizer.parse_range("120 - 126"), (120, 126))
         self.assertEqual(organizer.parse_range("128+"), (128, None))
         self.assertEqual(organizer.parse_range("174"), (174, 174))
-        for bad in ("fast", "1-2-3", "12.5"):
+        for bad in ("fast", "1-2-3", "12.5", "126-120"):
             with self.assertRaises(ValueError):
                 organizer.parse_range(bad)
 
@@ -171,6 +171,10 @@ class OrganizerTests(unittest.TestCase):
     def test_custom_validation_messages(self):
         for playlist, text in ((organizer.CustomPlaylist("Fast", bpm="quick"), "BPM 'quick'"),
                                (organizer.CustomPlaylist("Hot", energy="9"), "1 to 5"),
+                               (organizer.CustomPlaylist("House", bpm="100-50"),
+                                "Did you mean 100-150?"),
+                               (organizer.CustomPlaylist("Slow", bpm="130-125"),
+                                "Did you mean 125-130?"),
                                (organizer.CustomPlaylist("Empty"), "has no rules"),
                                (organizer.CustomPlaylist("Any", energy="1-5"), "has no rules")):
             with self.assertRaises(ValueError) as ctx:

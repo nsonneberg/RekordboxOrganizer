@@ -86,6 +86,8 @@ class Options:
     custom_enabled: bool = False   # sort the library into the user's own playlists
     custom: list[CustomPlaylist] = field(default_factory=list)
     custom_leftovers: bool = False  # songs matching no rule go to "Everything Else"
+    guess_genres: bool = True    # estimate genres for untagged / vaguely tagged songs
+    auto_genres: bool = False    # auto genre detection: a folder per genre family
     energy: bool = False         # listen to the music and score energy 1-5
     energy_ratings: bool = True  # ...and set the star rating to the energy level
     keep_ratings: bool = True    # ...except on tracks that already have a rating
@@ -108,8 +110,9 @@ class Options:
     folder_name: str = "Organized"
 
 
-# [(folder, [(playlist, [track ids])])]; folder TOP_LEVEL = straight into the main folder
-Plan = list[tuple[str, list[tuple[str, list[str]]]]]
+# [(folder, [(playlist, [track ids])])]. folder is a name, TOP_LEVEL (straight into the
+# main folder), or a tuple of names for nested folders, e.g. ("Auto Genres", "House").
+Plan = list[tuple[object, list[tuple[str, list[str]]]]]
 
 
 # --------------------------------------------------------------------------- #
@@ -302,7 +305,9 @@ def parse_range(text: str) -> tuple[Optional[int], Optional[int]]:
     if m.group(3):
         return (lo, None)
     hi = int(m.group(2)) if m.group(2) else lo
-    return (min(lo, hi), max(lo, hi))
+    if hi < lo:
+        raise ValueError(text)   # probably a typo ("100-50" for "100-150"); don't guess
+    return (lo, hi)
 
 
 @dataclass
@@ -335,6 +340,12 @@ def compile_custom(opt: Options) -> list[_Rule]:
         try:
             bpm = parse_range(cp.bpm)
         except ValueError:
+            backwards = re.fullmatch(r"\s*(\d+)\s*-\s*(\d+)\s*", cp.bpm)
+            if backwards and int(backwards.group(2)) < int(backwards.group(1)):
+                lo, hi = int(backwards.group(1)), int(backwards.group(2))
+                fix = f"{lo}-{hi + 100}" if hi < 100 <= lo < hi + 100 else f"{hi}-{lo}"
+                raise ValueError(f"Playlist '{name}': in BPM '{cp.bpm}' the second number is "
+                                 f"lower than the first. Did you mean {fix}?") from None
             raise ValueError(f"Playlist '{name}': BPM '{cp.bpm}' isn't a valid range. "
                              "Try 120-126, 128+ or 174, or leave it empty.") from None
         try:
@@ -358,15 +369,18 @@ def rules_need_energy(rules: list[_Rule]) -> bool:
     return any(r.energy != (None, None) for r in rules)
 
 
-def sort_into_custom(tracks: list[Track], rules: list[_Rule], leftovers: bool):
+def sort_into_custom(tracks: list[Track], rules: list[_Rule], leftovers: bool,
+                     guesses: Optional[dict[str, str]] = None):
     """Put each track in the playlist it fits best; tracks that fit none are left alone.
 
+    guesses: {track id: guessed genre} for songs with no or a vague tag.
     Returns [(name, [ids])]. Ties go to the playlist higher in the list.
     """
+    guesses = guesses or {}
     lists: list[tuple[str, list[str]]] = [(r.name, []) for r in rules]
     rest: list[str] = []
     for t in sorted(tracks, key=lambda t: (t.bpm, t.artist.casefold(), t.name.casefold())):
-        genre = _norm_genre(t.genre)
+        genre = _norm_genre(guesses.get(t.id, t.genre))
         best_i, best_score = None, None
         for i, rule in enumerate(rules):
             s = rule.score(t, genre)
@@ -381,13 +395,18 @@ def sort_into_custom(tracks: list[Track], rules: list[_Rule], leftovers: bool):
     return lists
 
 
-def build_plan(tracks: list[Track], opt: Options, rules: Optional[list[_Rule]] = None) -> Plan:
+def build_plan(tracks: list[Track], opt: Options, rules: Optional[list[_Rule]] = None,
+               guesses: Optional[dict[str, str]] = None) -> Plan:
     plan: Plan = []
 
     if rules is None:
         rules = compile_custom(opt)
     if rules:
-        plan.append((TOP_LEVEL, sort_into_custom(tracks, rules, opt.custom_leftovers)))
+        plan.append((TOP_LEVEL, sort_into_custom(tracks, rules, opt.custom_leftovers, guesses)))
+
+    if opt.auto_genres:
+        import genres
+        plan.extend(genres.auto_genre_plan(tracks, guesses or {}))
 
     if opt.energy:
         plan.append(("By Energy", _group(
@@ -482,6 +501,13 @@ def build_plan(tracks: list[Track], opt: Options, rules: Optional[list[_Rule]] =
 # Writing
 # --------------------------------------------------------------------------- #
 
+def folder_path(folder) -> tuple:
+    """Plan folder (name, TOP_LEVEL or tuple) -> tuple of folder names."""
+    if isinstance(folder, tuple):
+        return folder
+    return () if folder == TOP_LEVEL else (folder,)
+
+
 def _folder(parent: ET.Element, name: str) -> ET.Element:
     return ET.SubElement(parent, "NODE", Type="0", Name=name, Count="0")
 
@@ -513,15 +539,22 @@ def write_library(tree: ET.ElementTree, plan: Plan, folder_name: str, out_path: 
             top.remove(node)
 
     organized = _folder(top, folder_name)
+    folders = {(): organized}
+
+    def folder_for(path: tuple) -> ET.Element:
+        if path not in folders:
+            folders[path] = _folder(folder_for(path[:-1]), path[-1])
+        return folders[path]
+
     for folder_title, lists in plan:
-        sub = organized if folder_title == TOP_LEVEL else _folder(organized, folder_title)
+        sub = folder_for(folder_path(folder_title))
         for title, ids in lists:
             pl = ET.SubElement(sub, "NODE", Name=title, Type="1", KeyType="0",
                                Entries=str(len(ids)))
             for track_id in ids:
                 ET.SubElement(pl, "TRACK", Key=track_id)
-        _set_count(sub)
-    _set_count(organized)
+    for node in folders.values():
+        _set_count(node)
     _set_count(top)
 
     tree.write(out_path, encoding="UTF-8", xml_declaration=True)
@@ -543,18 +576,24 @@ def default_output_path(xml_path: str) -> str:
     return base + "_organized.xml"
 
 
-def apply_energy(tracks: list[Track], opt: Options, log: Callable[[str], None],
-                 progress: Optional[Callable[[int, int], None]] = None) -> dict[str, int]:
-    """Analyse the audio, set Track.energy, and return {track id: new star rating}."""
+def analyse_tracks(tracks: list[Track], log: Callable[[str], None],
+                   progress: Optional[Callable[[int, int], None]] = None) -> dict[str, dict]:
+    """Measure every track (for energy and genre guessing). Returns {id: features}."""
     import energy   # needs numpy + an audio decoder; only loaded when used
 
     # Prefer rekordbox's own analysis (works for every format, no decoding).
     # Never mix the two sources: their measurements aren't on the same scale.
     waveforms = {t.id: t.waveform for t in tracks if t.waveform}
     if waveforms:
-        features = energy.analyse_waveforms(waveforms, log, progress)
-    else:
-        features = energy.analyse_library({t.id: t.path for t in tracks if t.path}, log, progress)
+        return energy.analyse_waveforms(waveforms, log, progress)
+    return energy.analyse_library({t.id: t.path for t in tracks if t.path}, log, progress)
+
+
+def apply_energy(tracks: list[Track], opt: Options, features: dict[str, dict],
+                 log: Callable[[str], None]) -> dict[str, int]:
+    """Set Track.energy from the measurements; return {track id: new star rating}."""
+    import energy
+
     levels = energy.levels_from_features(features, {t.id: t.bpm for t in tracks})
     ratings: dict[str, int] = {}
     counts = [0] * 6
@@ -574,27 +613,48 @@ def _organize(tracks: list[Track], opt: Options, log: Callable[[str], None],
               progress: Optional[Callable[[int, int], None]]) -> tuple[Plan, dict[str, int], int]:
     """Shared by both modes: (plan, new star ratings, number of playlists)."""
     rules = compile_custom(opt)          # validate before any slow work
-    ratings: dict[str, int] = {}
-    if opt.energy or rules_need_energy(rules):
-        if not opt.energy:
-            log("Your playlist rules use energy, so the app will listen to your music.")
-        ratings = apply_energy(tracks, opt, log, progress)
-    plan = build_plan(tracks, opt, rules)
+    want_energy = opt.energy or rules_need_energy(rules)
+    want_guesses = opt.guess_genres and (opt.auto_genres or any(r.terms for r in rules))
+
+    features: dict[str, dict] = {}
+    if want_energy or want_guesses:
+        if want_energy and not opt.energy:
+            log("Your playlist rules use energy, so the app will measure your music.")
+        features = analyse_tracks(tracks, log, progress)
+    ratings = apply_energy(tracks, opt, features, log) if want_energy else {}
+    guesses: dict[str, str] = {}
+    if want_guesses:
+        import genres
+        guesses = genres.guess_genres(tracks, features, log)
+
+    plan = build_plan(tracks, opt, rules, guesses)
     if not plan and not ratings:
         raise ValueError("Nothing to do - tick at least one option.")
 
     total = 0
+    shown_parents = set()
     for folder, lists in plan:
-        if folder == TOP_LEVEL:
+        path = folder_path(folder)
+        if path == ():
             placed = sum(len(ids) for name, ids in lists if name != LEFTOVERS_NAME)
-            log(f"Sorted {placed} of {len(tracks)} tracks into your playlists:")
+            used = sum(1 for name, ids in lists if name != LEFTOVERS_NAME
+                       for i in ids if i in guesses)
+            log(f"Sorted {placed} of {len(tracks)} tracks into your playlists"
+                + (f" ({used} by guessed genre):" if used else ":"))
             for name, ids in lists:
                 log(f"    {name}: {len(ids)} track{'s' if len(ids) != 1 else ''}")
             if placed < len(tracks) and not opt.custom_leftovers:
                 log(f"  The other {len(tracks) - placed} tracks didn't fit any playlist "
                     "and were left alone.")
+        elif len(path) > 1:
+            if path[:-1] not in shown_parents:
+                shown_parents.add(path[:-1])
+                log(f"  {' / '.join(path[:-1])}:")
+            count = len(lists[0][1])    # the "All ..." playlist, or the only one
+            log(f"    {path[-1]}: {count} track{'s' if count != 1 else ''}, "
+                f"{len(lists)} playlist{'s' if len(lists) != 1 else ''}")
         else:
-            log(f"  {folder}: {len(lists)} playlist{'s' if len(lists) != 1 else ''}")
+            log(f"  {path[0]}: {len(lists)} playlist{'s' if len(lists) != 1 else ''}")
         total += len(lists)
     return plan, ratings, total
 
