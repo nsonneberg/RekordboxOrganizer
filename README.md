@@ -80,7 +80,16 @@ Artist · Record label · Release year · Star rating · Track color · Month ad
 **Cleanup playlists:** Possible duplicates · Missing files · Missing genre / key / BPM · Never played
 
 Everything goes into one playlist folder (named "Organized" by default). If you run
-the app again, it replaces that folder.
+the app again, it **adds to** folders and playlists that already have the same name
+(ignoring capitals): new songs go at the end, songs already there aren't added twice,
+and nothing is removed. Untick "Add to existing folders / playlists" to replace the
+folder instead.
+
+**Only new songs:** under "Songs to organize" pick *All*, *Added since last run* (the
+app remembers the date of each successful run), or *Added from … to …* (either date
+can be left empty). Only those songs are sorted, rated and added; the rest of the
+library is still read for comparison, so energy levels and genre guesses stay
+consistent with earlier runs.
 
 ## How to use
 

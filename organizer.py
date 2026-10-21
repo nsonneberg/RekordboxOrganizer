@@ -11,6 +11,7 @@ import os
 import re
 import xml.etree.ElementTree as ET
 from collections import defaultdict
+import datetime
 import sys
 from dataclasses import dataclass, field
 from typing import Callable, Optional
@@ -87,6 +88,9 @@ class Options:
     custom: list[CustomPlaylist] = field(default_factory=list)
     custom_leftovers: bool = False  # songs matching no rule go to "Everything Else"
     guess_genres: bool = True    # estimate genres for untagged / vaguely tagged songs
+    date_from: str = ""          # only organize songs added on/after this date (YYYY-MM-DD)
+    date_to: str = ""            # ...and on/before this one; "" = no limit
+    merge_existing: bool = True  # add to same-named folders/playlists instead of replacing
     auto_genres: bool = False    # auto genre detection: a folder per genre family
     energy: bool = False         # listen to the music and score energy 1-5
     energy_ratings: bool = True  # ...and set the star rating to the energy level
@@ -227,6 +231,31 @@ def _norm_title(s: str) -> str:
     s = re.sub(r"\(\s*original mix\s*\)", "", s)
     s = re.sub(r"[^\w]+", " ", s)
     return " ".join(s.split())
+
+
+def parse_date(text: str) -> str:
+    """'2026-10-21', '2026/10/21', '10/21/2026' or '' -> 'YYYY-MM-DD' or ''. Raises ValueError."""
+    t = text.strip()
+    if not t:
+        return ""
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y", "%m-%d-%Y", "%m/%d/%y"):
+        try:
+            return datetime.datetime.strptime(t, fmt).date().isoformat()
+        except ValueError:
+            pass
+    raise ValueError(f"'{text}' isn't a date. Use YYYY-MM-DD, e.g. 2026-10-21.")
+
+
+def select_tracks(tracks: list[Track], opt: Options) -> list[Track]:
+    """The tracks to organize: those added within the chosen dates (all if none set)."""
+    start, end = parse_date(opt.date_from), parse_date(opt.date_to)
+    if start and end and end < start:
+        raise ValueError(f"The end date ({end}) is before the start date ({start}).")
+    if not start and not end:
+        return list(tracks)
+    return [t for t in tracks
+            if t.date_added[:10] and (not start or t.date_added[:10] >= start)
+            and (not end or t.date_added[:10] <= end)]
 
 
 LEFTOVERS_NAME = "Everything Else"
@@ -516,8 +545,14 @@ def _set_count(folder: ET.Element) -> None:
     folder.set("Count", str(len(folder.findall("NODE"))))
 
 
+def same_name(a: Optional[str], b: str) -> bool:
+    return " ".join((a or "").split()).casefold() == " ".join(b.split()).casefold()
+
+
 def write_library(tree: ET.ElementTree, plan: Plan, folder_name: str, out_path: str,
-                  ratings: Optional[dict[str, int]] = None) -> None:
+                  ratings: Optional[dict[str, int]] = None, merge: bool = True,
+                  log: Callable[[str], None] = print) -> tuple[int, int, int]:
+    """Write the plan into the XML. Returns (playlists created, playlists added to, tracks added)."""
     root = tree.getroot()
     if ratings:
         for el in root.iterfind("COLLECTION/TRACK"):
@@ -533,31 +568,61 @@ def write_library(tree: ET.ElementTree, plan: Plan, folder_name: str, out_path: 
     if top is None:
         top = ET.SubElement(playlists, "NODE", Type="0", Name="ROOT", Count="0")
 
-    # Replace a folder left over from a previous run.
-    for node in top.findall("NODE"):
-        if node.get("Name") == folder_name:
-            top.remove(node)
+    def child(parent: ET.Element, name: str, kind: str) -> Optional[ET.Element]:
+        for node in parent.findall("NODE"):
+            if node.get("Type") == kind and same_name(node.get("Name"), name):
+                return node
+        return None
 
-    organized = _folder(top, folder_name)
+    organized = child(top, folder_name, "0")
+    if organized is not None and not merge:
+        top.remove(organized)
+        organized = None
+    if organized is not None:
+        log(f"Adding to your existing '{organized.get('Name')}' folder.")
+    else:
+        organized = _folder(top, folder_name)
     folders = {(): organized}
 
     def folder_for(path: tuple) -> ET.Element:
         if path not in folders:
-            folders[path] = _folder(folder_for(path[:-1]), path[-1])
+            parent = folder_for(path[:-1])
+            existing = child(parent, path[-1], "0")   # (an empty Element is falsy: no `or`)
+            folders[path] = existing if existing is not None else _folder(parent, path[-1])
         return folders[path]
 
+    created = updated = added = 0
     for folder_title, lists in plan:
         sub = folder_for(folder_path(folder_title))
         for title, ids in lists:
-            pl = ET.SubElement(sub, "NODE", Name=title, Type="1", KeyType="0",
-                               Entries=str(len(ids)))
+            pl = child(sub, title, "1")
+            if pl is None:
+                pl = ET.SubElement(sub, "NODE", Name=title, Type="1", KeyType="0", Entries="0")
+                created += 1
+                have = set()
+            else:
+                have = {t.get("Key") for t in pl.findall("TRACK")}
+                if any(i not in have for i in ids):
+                    updated += 1
             for track_id in ids:
-                ET.SubElement(pl, "TRACK", Key=track_id)
+                if track_id not in have:
+                    ET.SubElement(pl, "TRACK", Key=track_id)
+                    have.add(track_id)
+                    added += 1
+            pl.set("Entries", str(len(pl.findall("TRACK"))))
     for node in folders.values():
         _set_count(node)
     _set_count(top)
 
     tree.write(out_path, encoding="UTF-8", xml_declaration=True)
+    return created, updated, added
+
+
+def describe_changes(created: int, updated: int, added: int) -> str:
+    parts = [f"{created} new playlist{'s' if created != 1 else ''}"]
+    if updated:
+        parts.append(f"{updated} existing playlist{'s' if updated != 1 else ''} added to")
+    return ", ".join(parts) + f"; {added} track{'s' if added != 1 else ''} added in total."
 
 
 def app_data_dir() -> str:
@@ -613,6 +678,16 @@ def _organize(tracks: list[Track], opt: Options, log: Callable[[str], None],
               progress: Optional[Callable[[int, int], None]]) -> tuple[Plan, dict[str, int], int]:
     """Shared by both modes: (plan, new star ratings, number of playlists)."""
     rules = compile_custom(opt)          # validate before any slow work
+    library = tracks
+    tracks = select_tracks(library, opt)
+    if len(tracks) < len(library):
+        start, end = parse_date(opt.date_from), parse_date(opt.date_to)
+        span = (f"between {start} and {end}" if start and end
+                else f"on or after {start}" if start else f"on or before {end}")
+        log(f"{len(tracks)} of {len(library)} tracks were added {span}; only those will be "
+            "organized (the rest of the library is only used for comparison).")
+        if not tracks:
+            raise ValueError(f"No songs were added {span}.")
     want_energy = opt.energy or rules_need_energy(rules)
     want_guesses = opt.guess_genres and (opt.auto_genres or any(r.terms for r in rules))
 
@@ -620,12 +695,14 @@ def _organize(tracks: list[Track], opt: Options, log: Callable[[str], None],
     if want_energy or want_guesses:
         if want_energy and not opt.energy:
             log("Your playlist rules use energy, so the app will measure your music.")
-        features = analyse_tracks(tracks, log, progress)
-    ratings = apply_energy(tracks, opt, features, log) if want_energy else {}
+        features = analyse_tracks(library, log, progress)
+    ratings = apply_energy(library, opt, features, log) if want_energy else {}
+    chosen = {t.id for t in tracks}
+    ratings = {i: stars for i, stars in ratings.items() if i in chosen}
     guesses: dict[str, str] = {}
     if want_guesses:
         import genres
-        guesses = genres.guess_genres(tracks, features, log)
+        guesses = genres.guess_genres(library, features, log)
 
     plan = build_plan(tracks, opt, rules, guesses)
     if not plan and not ratings:
@@ -675,8 +752,9 @@ def run(opt: Options, xml_path: Optional[str] = None, log: Callable[[str], None]
             raise ValueError("The collection in this XML file is empty.")
         plan, ratings, total = _organize(tracks, opt, log, progress)
         out_path = default_output_path(xml_path)
-        write_library(tree, plan, folder_name, out_path, ratings)
-        log(f"Created {total} playlists.")
+        changes = write_library(tree, plan, folder_name, out_path, ratings,
+                                opt.merge_existing, log)
+        log(describe_changes(*changes))
         log(f"Saved: {out_path}")
         return out_path
 
@@ -697,8 +775,9 @@ def run(opt: Options, xml_path: Optional[str] = None, log: Callable[[str], None]
             raise ValueError("rekordbox was opened while working. Nothing was changed - "
                              "close rekordbox and press Run again.")
         log(f"Backed up your library to {os.path.basename(rbdb.backup(db_path))}")
-        rbdb.write_changes(db, contents, plan, folder_name, ratings, log)
-        log(f"Created {total} playlists in rekordbox.")
+        changes = rbdb.write_changes(db, contents, plan, folder_name, ratings, log,
+                                     opt.merge_existing)
+        log(describe_changes(*changes))
         return db_path
     finally:
         db.close()

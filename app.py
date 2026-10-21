@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import queue
@@ -108,9 +109,13 @@ class App(ttk.Frame):
         self.source = tk.StringVar(value="direct")
         self.xml_path = tk.StringVar()
         self.folder_name = tk.StringVar(value="Organized")
+        self.date_mode = tk.StringVar(value="all")      # all / since_last / range
+        self.date_from = tk.StringVar()
+        self.date_to = tk.StringVar()
+        self.last_run = ""                               # YYYY-MM-DD of the last successful run
         defaults = organizer.Options(custom_enabled=True)
         self.vars = {name: tk.BooleanVar(value=getattr(defaults, name)) for name in (
-            "custom_enabled", "custom_leftovers", "guess_genres", "auto_genres",
+            "custom_enabled", "custom_leftovers", "guess_genres", "auto_genres", "merge_existing",
             "energy", "energy_ratings", "keep_ratings",
             "genre", "bpm", "key", "artist", "label", "year", "rating", "colour",
             "date_added", "duplicates", "missing_files", "missing_info", "never_played")}
@@ -127,7 +132,7 @@ class App(ttk.Frame):
         master.columnconfigure(0, weight=1)
         master.rowconfigure(0, weight=1)
         for var in (self.source, self.vars["energy"], self.vars["energy_ratings"],
-                    self.vars["custom_enabled"]):
+                    self.vars["custom_enabled"], self.date_mode):
             var.trace_add("write", lambda *_: self._sync_states())
         self.playlist_count.trace_add("write", lambda *_: self._resize_rows())
         self._sync_states()
@@ -154,6 +159,23 @@ class App(ttk.Frame):
         self.browse_btn.grid(row=2, column=1, padx=(8, 0), pady=(4, 0))
         self.source_hint = ttk.Label(step1, foreground="gray")
         self.source_hint.grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        dates = ttk.Frame(step1)
+        dates.grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Label(dates, text="Songs to organize:").grid(row=0, column=0, sticky="w")
+        ttk.Radiobutton(dates, text="All", variable=self.date_mode,
+                        value="all").grid(row=0, column=1, padx=(8, 0))
+        self.since_rb = ttk.Radiobutton(dates, variable=self.date_mode, value="since_last")
+        self.since_rb.grid(row=0, column=2, padx=(8, 0))
+        ttk.Radiobutton(dates, text="Added from", variable=self.date_mode,
+                        value="range").grid(row=0, column=3, padx=(8, 0))
+        self.from_entry = ttk.Entry(dates, textvariable=self.date_from, width=11)
+        self.from_entry.grid(row=0, column=4, padx=(4, 0))
+        ttk.Label(dates, text="to").grid(row=0, column=5, padx=4)
+        self.to_entry = ttk.Entry(dates, textvariable=self.date_to, width=11)
+        self.to_entry.grid(row=0, column=6)
+        ttk.Label(dates, text="(YYYY-MM-DD, either can be empty)", foreground="gray"
+                  ).grid(row=0, column=7, padx=(6, 0))
 
         def check(parent, key, text, row, col, **kw):
             cb = ttk.Checkbutton(parent, text=text, variable=self.vars[key])
@@ -203,6 +225,8 @@ class App(ttk.Frame):
         run_row.columnconfigure(2, weight=1)
         ttk.Label(run_row, text="Main folder name:").grid(row=0, column=0)
         ttk.Entry(run_row, textvariable=self.folder_name, width=18).grid(row=0, column=1, padx=(6, 0))
+        check(run_row, "merge_existing", "Add to existing folders / playlists with the same name",
+              0, 2, padx=(12, 0))
         self.run_btn = ttk.Button(run_row, text="Run", command=self.start, width=12)
         self.run_btn.grid(row=0, column=3, sticky="e")
 
@@ -315,6 +339,11 @@ class App(ttk.Frame):
             "In rekordbox: File > Export Collection in xml format, then pick that file."
             if xml else
             "Reads and updates your rekordbox library directly. A backup is made first."))
+        self.since_rb.configure(text=f"Added since last run ({self.last_run})"
+                                if self.last_run else "Added since last run (none yet)")
+        ranged = "normal" if self.date_mode.get() == "range" else "disabled"
+        for w in (self.from_entry, self.to_entry):
+            w.configure(state=ranged)
         energy = self.vars["energy"].get()
         self.energy_ratings_cb.configure(state="normal" if energy else "disabled")
         self.keep_ratings_cb.configure(
@@ -343,9 +372,12 @@ class App(ttk.Frame):
             if name in self.vars and isinstance(value, bool):
                 self.vars[name].set(value)
         for var, key in ((self.source, "source"), (self.xml_path, "xml_path"),
-                         (self.folder_name, "folder_name")):
+                         (self.folder_name, "folder_name"), (self.date_mode, "date_mode"),
+                         (self.date_from, "date_from"), (self.date_to, "date_to")):
             if isinstance(data.get(key), str):
                 var.set(data[key])
+        if isinstance(data.get("last_run"), str):
+            self.last_run = data["last_run"]
         for var, key in ((self.bpm_step, "bpm_step"), (self.min_tracks, "min_tracks")):
             if isinstance(data.get(key), int):
                 var.set(data[key])
@@ -366,6 +398,10 @@ class App(ttk.Frame):
             "source": self.source.get(),
             "xml_path": self.xml_path.get(),
             "folder_name": self.folder_name.get(),
+            "date_mode": self.date_mode.get(),
+            "date_from": self.date_from.get(),
+            "date_to": self.date_to.get(),
+            "last_run": self.last_run,
             "bpm_step": self._int(self.bpm_step, 5),
             "min_tracks": self._int(self.min_tracks, 3),
             "playlists": [vars(p) for p in rows],
@@ -409,6 +445,11 @@ class App(ttk.Frame):
         opt.min_tracks = self._int(self.min_tracks, 3)
         opt.custom = [row.get() for row in self.rows]
         opt.folder_name = self.folder_name.get().strip() or "Organized"
+        mode = self.date_mode.get()
+        if mode == "since_last":
+            opt.date_from = self.last_run      # "" (never run) = all songs
+        elif mode == "range":
+            opt.date_from, opt.date_to = self.date_from.get(), self.date_to.get()
         return opt
 
     def start(self):
@@ -421,6 +462,7 @@ class App(ttk.Frame):
         opt = self.collect_options()
         try:
             organizer.compile_custom(opt)    # catch typos in the rules right away
+            organizer.select_tracks([], opt)  # ...and in the dates
         except ValueError as exc:
             messagebox.showwarning(APP_NAME, str(exc))
             return
@@ -466,6 +508,9 @@ class App(ttk.Frame):
                     self.progress.configure(value=done)
                 elif kind == "done":
                     self.finish()
+                    self.last_run = datetime.date.today().isoformat()
+                    self._sync_states()
+                    self.save_settings()
                     self.output_path, folder, was_xml = payload
                     message = (XML_DONE if was_xml else DIRECT_DONE).format(folder=folder)
                     self.open_btn.configure(text="Show output file" if was_xml else "Show library folder")

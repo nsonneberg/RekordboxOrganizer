@@ -19,9 +19,10 @@ from uuid import uuid4
 # the pure-Python fallback is plenty fast for this.
 os.environ.setdefault("DISABLE_SQLALCHEMY_CEXT_RUNTIME", "1")
 
-from organizer import COLOUR_ORDER, Plan, Track, folder_path, to_camelot   # noqa: E402
+from organizer import COLOUR_ORDER, Plan, Track, folder_path, same_name, to_camelot  # noqa: E402
 
 KEEP_BACKUPS = 3
+PLAYLIST, FOLDER = 0, 1   # DjmdPlaylist.Attribute (smart playlists are 4)
 # rekordbox's built-in sampler sounds (older and newer install locations)
 SAMPLER_MARKERS = ("/pioneerdj/sampler/", "/rekordbox/sampler/")
 
@@ -85,7 +86,8 @@ def load_tracks(db) -> tuple[list[Track], dict]:
             year=_int(c.ReleaseYear),
             rating=_int(c.Rating),
             colour=colour if colour in COLOUR_ORDER else "",
-            date_added=c.StockDate or c.DateCreated or "",
+            # StockDate = when it was added to rekordbox (DateCreated is the file's date)
+            date_added=c.StockDate or (c.created_at.date().isoformat() if c.created_at else ""),
             play_count=_int(c.DJPlayCount),
             path=os.path.normpath(c.FolderPath) if c.FolderPath else "",
             waveform=waveform if waveform and os.path.exists(waveform) else "",
@@ -117,7 +119,14 @@ def backup(db_path: str) -> str:
 
 
 def write_changes(db, contents: dict, plan: Plan, folder_name: str,
-                  ratings: dict[str, int], log: Callable[[str], None] = print) -> None:
+                  ratings: dict[str, int], log: Callable[[str], None] = print,
+                  merge: bool = True) -> tuple[int, int, int]:
+    """Apply ratings and the plan. Returns (playlists created, playlists added to, tracks added).
+
+    With merge, same-named folders and playlists (ignoring case) are reused and
+    new tracks are appended; nothing already in them is removed. Smart playlists
+    are never touched.
+    """
     from pyrekordbox.masterdb import models
 
     changed = 0
@@ -129,29 +138,59 @@ def write_changes(db, contents: dict, plan: Plan, folder_name: str,
     if ratings:
         log(f"Updated star ratings on {changed} tracks.")
 
+    created = updated = added = 0
     if plan:
-        for old in db.get_playlist(Name=folder_name, ParentID="root").all():
-            if old.Attribute == 1 and not old.rb_local_deleted:   # 1 = folder
-                log(f"Replacing the existing '{folder_name}' folder.")
-                db.delete_playlist(old)
-        db.flush()
+        def child(parent_id: str, name: str, attribute: int):
+            matches = [p for p in db.get_playlist(ParentID=parent_id).all()
+                       if p.Attribute == attribute and not p.rb_local_deleted
+                       and same_name(p.Name, name)]
+            return min(matches, key=lambda p: p.Seq or 0) if matches else None
 
-        folders = {(): db.create_playlist_folder(folder_name)}
+        top = child("root", folder_name, FOLDER)
+        if top is not None and not merge:
+            log(f"Replacing the existing '{top.Name}' folder.")
+            db.delete_playlist(top)
+            db.flush()
+            top = None
+        if top is not None:
+            log(f"Adding to your existing '{top.Name}' folder.")
+        else:
+            top = db.create_playlist_folder(folder_name)
+        folders = {(): top}
 
         def folder_for(path: tuple):
             if path not in folders:
-                folders[path] = db.create_playlist_folder(path[-1], parent=folder_for(path[:-1]))
+                parent = folder_for(path[:-1])
+                existing = child(parent.ID, path[-1], FOLDER)
+                folders[path] = (existing if existing is not None
+                                 else db.create_playlist_folder(path[-1], parent=parent))
             return folders[path]
 
         for folder_title, lists in plan:
             sub = folder_for(folder_path(folder_title))
             for title, ids in lists:
-                pl = db.create_playlist(title, parent=sub)
+                pl = child(sub.ID, title, PLAYLIST)
+                if pl is None:
+                    pl = db.create_playlist(title, parent=sub)
+                    have, last = set(), 0
+                    created += 1
+                else:
+                    songs = db.get_playlist_songs(PlaylistID=pl.ID).all()
+                    have = {str(s.ContentID) for s in songs}
+                    last = max((s.TrackNo or 0 for s in songs), default=0)
+                    if any(str(i) not in have for i in ids):
+                        updated += 1
                 now = datetime.datetime.now()
                 # Same as db.add_to_playlist(), minus a COUNT query per track.
-                for n, track_id in enumerate(ids, 1):
+                for track_id in ids:
+                    if str(track_id) in have:
+                        continue
+                    last += 1
                     db.add(models.DjmdSongPlaylist.create(
                         ID=str(uuid4()), PlaylistID=str(pl.ID), ContentID=str(track_id),
-                        TrackNo=n, UUID=str(uuid4()), created_at=now, updated_at=now))
+                        TrackNo=last, UUID=str(uuid4()), created_at=now, updated_at=now))
+                    have.add(str(track_id))
+                    added += 1
 
     db.commit()
+    return created, updated, added
