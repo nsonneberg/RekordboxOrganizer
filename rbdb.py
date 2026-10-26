@@ -11,6 +11,7 @@ import datetime
 import glob
 import logging
 import os
+import re
 import shutil
 from typing import Callable, Optional
 from uuid import uuid4
@@ -52,6 +53,15 @@ def open_database(path: Optional[str] = None):
 
 def database_path(db) -> str:
     return str(db.engine.url.database)
+
+
+def library_path() -> str:
+    """Where rekordbox's master.db is."""
+    db = open_database()
+    try:
+        return database_path(db)
+    finally:
+        db.close()
 
 
 def _int(value) -> int:
@@ -96,8 +106,18 @@ def load_tracks(db) -> tuple[list[Track], dict]:
     return tracks, contents
 
 
+# rekordbox keeps recent changes in these journal files next to master.db
+# (SQLite's write-ahead log) until it folds them in, so they belong together.
+JOURNALS = ("-wal", "-shm")
+BACKUP_GLOB = "master.organizer-backup-*.db"
+
+
+def _backup_parts(path: str) -> list[str]:
+    return [path] + [path + j for j in JOURNALS] + [path[:-3] + ".masterPlaylists6.xml"]
+
+
 def backup(db_path: str) -> str:
-    """Copy master.db (and the playlist index next to it); keep the newest few."""
+    """Copy master.db with its journal files (and the playlist index); keep the newest few."""
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     folder = os.path.dirname(db_path)
     dest = os.path.join(folder, f"master.organizer-backup-{stamp}.db")
@@ -106,26 +126,103 @@ def backup(db_path: str) -> str:
         n += 1
         dest = os.path.join(folder, f"master.organizer-backup-{stamp}-{n}.db")
     shutil.copy2(db_path, dest)
+    for j in JOURNALS:
+        if os.path.exists(db_path + j):
+            shutil.copy2(db_path + j, dest + j)
     xml = os.path.join(folder, "masterPlaylists6.xml")
     if os.path.exists(xml):
         shutil.copy2(xml, dest[:-3] + ".masterPlaylists6.xml")
 
-    old = sorted(glob.glob(os.path.join(folder, "master.organizer-backup-*.db")))
-    for path in old[:-KEEP_BACKUPS]:
-        for p in (path, path[:-3] + ".masterPlaylists6.xml"):
+    for path in list_backups(folder)[KEEP_BACKUPS:]:
+        for p in _backup_parts(path):
             if os.path.exists(p):
                 os.remove(p)
     return dest
 
 
+def list_backups(folder: str) -> list[str]:
+    """The app's backups in folder, newest first."""
+    return sorted(glob.glob(os.path.join(folder, BACKUP_GLOB)), reverse=True)
+
+
+def backup_time(path: str) -> datetime.datetime:
+    m = re.search(r"backup-(\d{8}-\d{6})", os.path.basename(path))
+    if m:
+        return datetime.datetime.strptime(m.group(1), "%Y%m%d-%H%M%S")
+    return datetime.datetime.fromtimestamp(os.path.getmtime(path))
+
+
+def restore_backup(backup_path: str, db_path: str) -> str:
+    """Put a backup back as the library. rekordbox must be closed.
+
+    The current library (with its journal files) is first saved as
+    master.before-undo-<time>.db, so the undo itself can be undone.
+    Returns that file's path.
+    """
+    folder = os.path.dirname(db_path)
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    keep = os.path.join(folder, f"master.before-undo-{stamp}.db")
+    shutil.copy2(db_path, keep)
+    for j in JOURNALS:
+        if os.path.exists(db_path + j):
+            shutil.copy2(db_path + j, keep + j)
+    xml = os.path.join(folder, "masterPlaylists6.xml")
+    if os.path.exists(xml):
+        shutil.copy2(xml, keep[:-3] + ".masterPlaylists6.xml")
+
+    # Journals first: the library's own must never be paired with the backup.
+    for j in JOURNALS:
+        if os.path.exists(db_path + j):
+            os.remove(db_path + j)
+    shutil.copy2(backup_path, db_path)
+    for j in JOURNALS:
+        if os.path.exists(backup_path + j):
+            shutil.copy2(backup_path + j, db_path + j)
+    saved_xml = backup_path[:-3] + ".masterPlaylists6.xml"
+    if os.path.exists(saved_xml):
+        shutil.copy2(saved_xml, xml)
+
+    undos = sorted(glob.glob(os.path.join(folder, "master.before-undo-*.db")), reverse=True)
+    for path in undos[KEEP_BACKUPS:]:
+        for p in _backup_parts(path):
+            if os.path.exists(p):
+                os.remove(p)
+    return keep
+
+
+def open_preview_copy(db) -> tuple[object, str]:
+    """A copy of the open library to try a run on: (database, temp folder).
+
+    Analysis files are still read from the real library's folder.
+    """
+    import pathlib
+    import tempfile
+
+    src = database_path(db)
+    work = tempfile.mkdtemp(prefix="rbo-preview-")
+    for suffix in ("",) + JOURNALS:
+        if os.path.exists(src + suffix):
+            shutil.copy2(src + suffix, os.path.join(work, "master.db" + suffix))
+    xml = os.path.join(os.path.dirname(src), "masterPlaylists6.xml")
+    if os.path.exists(xml):
+        shutil.copy2(xml, work)
+    copy = open_database(os.path.join(work, "master.db"))
+    copy._share_dir = pathlib.Path(os.path.dirname(src)) / "share"
+    return copy, work
+
+
 def write_changes(db, contents: dict, plan: Plan, folder_name: str,
                   ratings: dict[str, int], log: Callable[[str], None] = print,
-                  merge: bool = True, evict: Optional[dict] = None) -> tuple[int, int, int, list]:
+                  merge: bool = True, evict=None,
+                  changes=None, commit: bool = True) -> tuple[int, int, int, list]:
     """Apply ratings and the plan.
 
+    changes: an organizer.Changes to record every change in (for previews).
+    commit: False leaves everything unsaved (the caller throws it away).
+
     Returns (playlists created, playlists added to, tracks added,
-    [(playlist name, track id) taken out]). evict: {playlist name: track ids}
-    to take out of existing playlists directly in the main folder.
+    [(playlist name, track id) taken out]). evict: an organizer.Evictor saying
+    which songs to take out of existing playlists.
 
     With merge, same-named folders and playlists (ignoring case) are reused and
     new tracks are appended; nothing already in them is removed. Smart playlists
@@ -137,6 +234,8 @@ def write_changes(db, contents: dict, plan: Plan, folder_name: str,
     for track_id, stars in ratings.items():
         content = contents[track_id]
         if _int(content.Rating) != stars:
+            if changes is not None:
+                changes.ratings.append((track_id, _int(content.Rating), stars))
             content.Rating = stars
             changed += 1
     if ratings:
@@ -163,10 +262,10 @@ def write_changes(db, contents: dict, plan: Plan, folder_name: str,
             top = db.create_playlist_folder(folder_name)
         folders = {(): top}
 
-        for name, ids in (evict or {}).items():
-            pl = child(top.ID, name, PLAYLIST)
-            if pl is None:
-                continue
+        def take_out(pl, path: tuple):
+            ids = evict.ids(path, pl.Name or "")
+            if not ids:
+                return
             # Like db.remove_from_playlist(), but without its commit per song,
             # so the whole run is still saved at once.
             songs = sorted(db.get_playlist_songs(PlaylistID=pl.ID).all(),
@@ -176,6 +275,9 @@ def write_changes(db, contents: dict, plan: Plan, folder_name: str,
                 if str(song.ContentID) in ids:
                     db.delete(song)
                     removed.append((pl.Name, str(song.ContentID)))
+                    if changes is not None:
+                        changes.removed.append((" / ".join((top.Name,) + path + (pl.Name,)),
+                                                str(song.ContentID)))
                 else:
                     keep.append(song)
             if len(keep) < len(songs):
@@ -189,6 +291,18 @@ def write_changes(db, contents: dict, plan: Plan, folder_name: str,
                     db.registry.on_move(renumbered)
                 db.flush()
 
+        def walk(folder, path: tuple):
+            for item in db.get_playlist(ParentID=folder.ID).all():
+                if item.rb_local_deleted:
+                    continue
+                if item.Attribute == PLAYLIST:
+                    take_out(item, path)
+                elif item.Attribute == FOLDER and evict.scans(path + (item.Name or "",)):
+                    walk(item, path + (item.Name or "",))
+
+        if evict:
+            walk(top, ())
+
         def folder_for(path: tuple):
             if path not in folders:
                 parent = folder_for(path[:-1])
@@ -198,13 +312,17 @@ def write_changes(db, contents: dict, plan: Plan, folder_name: str,
             return folders[path]
 
         for folder_title, lists in plan:
-            sub = folder_for(folder_path(folder_title))
+            path = folder_path(folder_title)
+            sub = folder_for(path)
             for title, ids in lists:
+                where = " / ".join((top.Name,) + path + (title,))
                 pl = child(sub.ID, title, PLAYLIST)
                 if pl is None:
                     pl = db.create_playlist(title, parent=sub)
                     have, last = set(), 0
                     created += 1
+                    if changes is not None:
+                        changes.created.append(where)
                 else:
                     songs = db.get_playlist_songs(PlaylistID=pl.ID).all()
                     have = {str(s.ContentID) for s in songs}
@@ -222,8 +340,13 @@ def write_changes(db, contents: dict, plan: Plan, folder_name: str,
                         TrackNo=last, UUID=str(uuid4()), created_at=now, updated_at=now))
                     have.add(str(track_id))
                     added += 1
+                    if changes is not None:
+                        changes.added.append((where, str(track_id)))
 
-    db.commit()
+    if commit:
+        db.commit()
+    else:
+        db.flush()
     return created, updated, added, removed
 
 
@@ -266,7 +389,8 @@ def plan_hot_cues(db, tracks: list[Track], log: Callable[[str], None] = print) -
     return plan
 
 
-def add_hot_cues(db, contents: dict, plan: dict, log: Callable[[str], None] = print) -> None:
+def add_hot_cues(db, contents: dict, plan: dict, log: Callable[[str], None] = print,
+                 changes=None) -> None:
     """Add the planned hot cues (saved by the next commit)."""
     from pyrekordbox.masterdb import models
 
@@ -280,6 +404,8 @@ def add_hot_cues(db, contents: dict, plan: dict, log: Callable[[str], None] = pr
                 cue_id = db.generate_unused_id(models.DjmdCue, is_28_bit=False)
             taken.add(cue_id)
             ms = int(phrase.start_ms)
+            if changes is not None:
+                changes.cues.append((track_id, "ABCDEFGH"[pad], phrase.label, ms))
             # Same fields rekordbox fills in for a hot cue set on a pad.
             db.add(models.DjmdCue.create(
                 ID=str(cue_id), ContentID=str(content.ID), ContentUUID=content.UUID,

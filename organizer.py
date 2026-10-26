@@ -126,6 +126,21 @@ Plan = list[tuple[object, list[tuple[str, list[str]]]]]
 # Parsing
 # --------------------------------------------------------------------------- #
 
+@dataclass
+class Changes:
+    """Every change a run makes, for the preview."""
+    ratings: list = field(default_factory=list)   # (track id, old stars, new stars)
+    created: list = field(default_factory=list)   # "Organized / House"
+    added: list = field(default_factory=list)     # (playlist, track id)
+    removed: list = field(default_factory=list)   # (playlist, track id)
+    cues: list = field(default_factory=list)      # (track id, pad, label, ms)
+    genres: list = field(default_factory=list)    # (track id, old genre, new genre)
+    names: dict = field(default_factory=dict)     # track id -> song name, for showing them
+
+    def empty(self) -> bool:
+        return not any(v for k, v in vars(self).items() if k != "names")
+
+
 def _int(value: Optional[str]) -> int:
     try:
         return int(float(value or 0))
@@ -467,6 +482,51 @@ def evictions(plan: Plan, rules: list[_Rule]) -> dict[str, set[str]]:
     return out
 
 
+def _key(name: str) -> str:
+    return " ".join(name.split()).casefold()
+
+
+class Evictor:
+    """Which songs to take out of existing playlists in the main folder on a re-run.
+
+    - The user's own playlists (directly in the main folder): a song leaves only
+      when it now fits a different one of their playlists best (evictions()).
+    - Folders the app generates (By Energy, Auto Genres, By BPM, Cleanup...):
+      they show values the app works out, so for the songs being organized
+      they're brought up to date - a song whose energy went from 3 to 2 leaves
+      "3 - Groove". Only folders this run generates are touched.
+    """
+
+    def __init__(self, top: dict[str, set[str]], plan: Plan, chosen: set[str], sync: bool):
+        self.top = {_key(name): ids for name, ids in top.items()}
+        self.placed: dict[tuple, set[str]] = {}
+        self.roots: set[str] = set()
+        self.chosen = chosen
+        if sync:
+            for folder, lists in plan:
+                path = folder_path(folder)
+                if path:
+                    self.roots.add(_key(path[0]))
+                    for name, ids in lists:
+                        key = (tuple(_key(p) for p in path), _key(name))
+                        self.placed.setdefault(key, set()).update(ids)
+
+    def __bool__(self) -> bool:
+        return bool(self.top or self.roots)
+
+    def ids(self, path: tuple, name: str) -> set[str]:
+        """Track ids to take out of playlist `name` in folder `path` (below the main folder)."""
+        if not path:
+            return self.top.get(_key(name), set())
+        if _key(path[0]) not in self.roots:
+            return set()
+        return self.chosen - self.placed.get((tuple(_key(p) for p in path), _key(name)), set())
+
+    def scans(self, path: tuple) -> bool:
+        """Whether to look inside the folder at `path`."""
+        return not path or _key(path[0]) in self.roots
+
+
 def build_plan(tracks: list[Track], opt: Options, rules: Optional[list[_Rule]] = None,
                guesses: Optional[dict[str, str]] = None,
                by_guess: Optional[set] = None) -> Plan:
@@ -597,11 +657,11 @@ def same_name(a: Optional[str], b: str) -> bool:
 def write_library(tree: ET.ElementTree, plan: Plan, folder_name: str, out_path: str,
                   ratings: Optional[dict[str, int]] = None, merge: bool = True,
                   log: Callable[[str], None] = print,
-                  evict: Optional[dict[str, set[str]]] = None) -> tuple[int, int, int, list]:
+                  evict: Optional["Evictor"] = None,
+                  changes: Optional[Changes] = None) -> tuple[int, int, int, list]:
     """Write the plan into the XML.
 
-    evict: {playlist name: track ids} to take out of existing playlists directly
-    in the main folder (see evictions()).
+    evict: which songs to take out of existing playlists (see Evictor).
     Returns (playlists created, playlists added to, tracks added,
     [(playlist name, track id) taken out]).
     """
@@ -610,6 +670,9 @@ def write_library(tree: ET.ElementTree, plan: Plan, folder_name: str, out_path: 
         for el in root.iterfind("COLLECTION/TRACK"):
             stars = ratings.get(el.get("TrackID", ""))
             if stars is not None:
+                old = _int(el.get("Rating")) // 51
+                if changes is not None and old != stars:
+                    changes.ratings.append((el.get("TrackID"), old, stars))
                 el.set("Rating", str(stars * 51))
 
 
@@ -644,25 +707,39 @@ def write_library(tree: ET.ElementTree, plan: Plan, folder_name: str, out_path: 
         return folders[path]
 
     removed = []
-    for name, ids in (evict or {}).items():
-        pl = child(organized, name, "1")
-        if pl is None:
-            continue
-        for el in pl.findall("TRACK"):
-            if el.get("Key") in ids:
-                pl.remove(el)
-                removed.append((pl.get("Name"), el.get("Key")))
-        pl.set("Entries", str(len(pl.findall("TRACK"))))
+
+    def take_out(node: ET.Element, path: tuple):
+        for el in node.findall("NODE"):
+            name = el.get("Name") or ""
+            if el.get("Type") == "1":
+                ids = evict.ids(path, name)
+                for t in el.findall("TRACK"):
+                    if t.get("Key") in ids:
+                        el.remove(t)
+                        removed.append((name, t.get("Key")))
+                        if changes is not None:
+                            changes.removed.append((" / ".join(
+                                (organized.get("Name"),) + path + (name,)), t.get("Key")))
+                el.set("Entries", str(len(el.findall("TRACK"))))
+            elif el.get("Type") == "0" and evict.scans(path + (name,)):
+                take_out(el, path + (name,))
+
+    if evict:
+        take_out(organized, ())
 
     created = updated = added = 0
     for folder_title, lists in plan:
-        sub = folder_for(folder_path(folder_title))
+        path = folder_path(folder_title)
+        sub = folder_for(path)
         for title, ids in lists:
+            where = " / ".join((organized.get("Name"),) + path + (title,))
             pl = child(sub, title, "1")
             if pl is None:
                 pl = ET.SubElement(sub, "NODE", Name=title, Type="1", KeyType="0", Entries="0")
                 created += 1
                 have = set()
+                if changes is not None:
+                    changes.created.append(where)
             else:
                 have = {t.get("Key") for t in pl.findall("TRACK")}
                 if any(i not in have for i in ids):
@@ -672,9 +749,12 @@ def write_library(tree: ET.ElementTree, plan: Plan, folder_name: str, out_path: 
                     ET.SubElement(pl, "TRACK", Key=track_id)
                     have.add(track_id)
                     added += 1
+                    if changes is not None:
+                        changes.added.append((where, track_id))
             pl.set("Entries", str(len(pl.findall("TRACK"))))
-    for node in folders.values():
-        _set_count(node)
+    for node in organized.iter("NODE"):
+        if node.get("Type") == "0":
+            _set_count(node)
     _set_count(top)
 
     tree.write(out_path, encoding="UTF-8", xml_declaration=True)
@@ -828,20 +908,25 @@ def _organize(tracks: list[Track], opt: Options, log: Callable[[str], None],
     return plan, ratings, tracks
 
 
-def _evictions(plan: Plan, opt: Options) -> dict[str, set[str]]:
-    if not (opt.merge_existing and opt.move_mismatched and opt.custom_enabled):
-        return {}
-    return evictions(plan, compile_custom(opt))
+def _evictor(plan: Plan, opt: Options, chosen: list[Track]) -> Evictor:
+    move = opt.merge_existing and opt.move_mismatched
+    top = evictions(plan, compile_custom(opt)) if move and opt.custom_enabled else {}
+    return Evictor(top, plan, {t.id for t in chosen}, move)
 
 
 def run(opt: Options, xml_path: Optional[str] = None, log: Callable[[str], None] = print,
-        progress: Optional[Callable[[int, int], None]] = None) -> str:
+        progress: Optional[Callable[[int, int], None]] = None,
+        preview: bool = False, changes: Optional[Changes] = None) -> str:
     """Do the whole job.
 
     With xml_path, reads that export and writes a new XML next to it; returns its path.
     Without, works directly on rekordbox's database; returns the database path.
+    preview: do everything on a throwaway copy and save nothing; fill `changes`
+    to see what a real run would do. Works while rekordbox is open.
     """
     folder_name = opt.folder_name.strip() or "Organized"
+    if changes is None:
+        changes = Changes()
     if xml_path:
         log(f"Reading {os.path.basename(xml_path)} ...")
         tree, tracks = load_library(xml_path)
@@ -852,39 +937,131 @@ def run(opt: Options, xml_path: Optional[str] = None, log: Callable[[str], None]
             log("Hot cues need rekordbox's phrase analysis, so they're only added when "
                 "working straight from rekordbox. Skipping them.")
             opt = dataclasses.replace(opt, phrase_cues=False)
+        changes.names.update((t.id, t.name) for t in tracks)
         plan, ratings, chosen = _organize(tracks, opt, log, progress)
         out_path = default_output_path(xml_path)
-        changes = write_library(tree, plan, folder_name, out_path, ratings,
-                                opt.merge_existing, log, _evictions(plan, opt))
-        describe_moves(changes[3], plan, tracks, log)
-        log(describe_changes(*changes))
+        if preview:
+            import tempfile
+            fd, out_path = tempfile.mkstemp(suffix=".xml")
+            os.close(fd)
+        try:
+            counts = write_library(tree, plan, folder_name, out_path, ratings,
+                                   opt.merge_existing, log, _evictor(plan, opt, chosen),
+                                   changes)
+        finally:
+            if preview:
+                os.remove(out_path)
+        describe_moves(counts[3], plan, tracks, log)
+        log(describe_changes(*counts))
+        if preview:
+            return xml_path
         log(f"Saved: {out_path}")
         return out_path
 
     import rbdb
-    if rbdb.rekordbox_running():
+    if not preview and rbdb.rekordbox_running():
         raise ValueError("rekordbox is open. Please close it first, then press Run again.")
     log("Opening your rekordbox library ...")
     db = rbdb.open_database()
+    work = None
+    if preview:
+        real, (db, work) = db, rbdb.open_preview_copy(db)
+        real.close()
     try:
         db_path = rbdb.database_path(db)
         tracks, contents = rbdb.load_tracks(db)
         log(f"Found {len(tracks)} tracks.")
         if not tracks:
             raise ValueError("Your rekordbox collection is empty.")
+        changes.names.update((t.id, t.name) for t in tracks)
         plan, ratings, chosen = _organize(tracks, opt, log, progress)
         hot_cues = rbdb.plan_hot_cues(db, chosen, log) if opt.phrase_cues else {}
 
-        if rbdb.rekordbox_running():
-            raise ValueError("rekordbox was opened while working. Nothing was changed - "
-                             "close rekordbox and press Run again.")
-        log(f"Backed up your library to {os.path.basename(rbdb.backup(db_path))}")
-        rbdb.add_hot_cues(db, contents, hot_cues, log)     # saved with everything below
-        changes = rbdb.write_changes(db, contents, plan, folder_name, ratings, log,
-                                     opt.merge_existing, _evictions(plan, opt))
-        describe_moves(changes[3], plan, tracks, log)
+        if not preview:
+            if rbdb.rekordbox_running():
+                raise ValueError("rekordbox was opened while working. Nothing was changed - "
+                                 "close rekordbox and press Run again.")
+            log(f"Backed up your library to {os.path.basename(rbdb.backup(db_path))}")
+        rbdb.add_hot_cues(db, contents, hot_cues, log, changes)   # saved with the rest
+        counts = rbdb.write_changes(db, contents, plan, folder_name, ratings, log,
+                                    opt.merge_existing, _evictor(plan, opt, chosen),
+                                    changes, commit=not preview)
+        describe_moves(counts[3], plan, tracks, log)
         if plan:
-            log(describe_changes(*changes))
+            log(describe_changes(*counts))
         return db_path
     finally:
         db.close()
+        if work:
+            import shutil
+            shutil.rmtree(work, ignore_errors=True)
+
+
+def summarize_changes(changes: Changes, names: Optional[dict[str, str]] = None) -> str:
+    """A readable list of what a run would change. names: {track id: song name}."""
+    names = names or changes.names
+
+    def song(track_id):
+        return names.get(track_id, track_id)
+
+    lines: list[str] = []
+    if changes.empty():
+        return "Nothing would change: everything is already organized this way."
+
+    def group(playlist: str) -> str:
+        # "Organized / House" -> "Organized"; "Organized / By Energy / 3 - Groove"
+        # -> "Organized / By Energy": a move stays within one of these.
+        parts = playlist.split(" / ")
+        return " / ".join(parts[:2]) if len(parts) > 2 else parts[0]
+
+    moved_from = {(tid, group(pl)): pl for pl, tid in changes.removed}
+    moved_to = {(tid, group(pl)): pl for pl, tid in changes.added
+                if (tid, group(pl)) in moved_from}
+    if moved_from:
+        lines.append(f"MOVED ({len(moved_from)} songs)")
+        for (tid, where), old in moved_from.items():
+            new = moved_to.get((tid, where))
+            lines.append(f"  {song(tid)}:  {old.split(' / ')[-1]} -> "
+                         + (new.split(" / ")[-1] if new else "removed (no longer fits)")
+                         + (f"   [{where.split(' / ', 1)[1]}]" if " / " in where else ""))
+        lines.append("")
+
+    if changes.created:
+        lines.append(f"NEW PLAYLISTS ({len(changes.created)})")
+        lines.extend(f"  {p}" for p in changes.created)
+        lines.append("")
+
+    added = [(pl, tid) for pl, tid in changes.added if (tid, group(pl)) not in moved_to]
+    if added:
+        by_playlist: dict[str, list[str]] = defaultdict(list)
+        for pl, tid in added:
+            by_playlist[pl].append(tid)
+        lines.append(f"ADDED TO PLAYLISTS ({len(added)} entries)")
+        for pl, ids in by_playlist.items():
+            shown = ", ".join(song(i) for i in ids[:5])
+            more = f" and {len(ids) - 5} more" if len(ids) > 5 else ""
+            lines.append(f"  {pl}: +{len(ids)}  ({shown}{more})")
+        lines.append("")
+
+    if changes.ratings:
+        lines.append(f"STAR RATINGS ({len(changes.ratings)} songs)")
+        for tid, old, new in sorted(changes.ratings, key=lambda r: -r[2]):
+            was = f"{old} star{'s' if old != 1 else ''}" if old else "unrated"
+            lines.append(f"  {song(tid)}:  {was} -> {new} star{'s' if new != 1 else ''}")
+        lines.append("")
+
+    if changes.genres:
+        lines.append(f"GENRE TAGS ({len(changes.genres)} songs)")
+        for tid, old, new in changes.genres:
+            lines.append(f"  {song(tid)}:  {old or '(none)'} -> {new}")
+        lines.append("")
+
+    if changes.cues:
+        by_track: dict[str, list[str]] = defaultdict(list)
+        for tid, pad, label, ms in changes.cues:
+            by_track[tid].append(f"{pad} {label} {ms // 60000}:{ms // 1000 % 60:02d}")
+        lines.append(f"CUES ({len(changes.cues)} on {len(by_track)} songs)")
+        for tid, cues in by_track.items():
+            lines.append(f"  {song(tid)}:  " + ", ".join(cues))
+        lines.append("")
+    return "\n".join(lines).rstrip()

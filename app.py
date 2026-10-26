@@ -256,8 +256,15 @@ class App(ttk.Frame):
         ttk.Entry(run_row, textvariable=self.folder_name, width=18).grid(row=0, column=1, padx=(6, 0))
         check(run_row, "merge_existing", "Add to existing folders / playlists with the same name",
               0, 2, padx=(12, 0))
-        self.run_btn = ttk.Button(run_row, text="Run", command=self.start, width=12)
-        self.run_btn.grid(row=0, column=3, sticky="e")
+        buttons = ttk.Frame(run_row)
+        buttons.grid(row=0, column=3, sticky="e")
+        self.undo_btn = ttk.Button(buttons, text="Undo last run...", command=self.undo)
+        self.undo_btn.pack(side="left")
+        self.preview_btn = ttk.Button(buttons, text="Preview", width=10,
+                                      command=lambda: self.start(preview=True))
+        self.preview_btn.pack(side="left", padx=(8, 0))
+        self.run_btn = ttk.Button(buttons, text="Run", command=self.start, width=12)
+        self.run_btn.pack(side="left", padx=(8, 0))
 
         self.progress = ttk.Progressbar(self, mode="determinate")
         self.progress.grid(sticky="ew", pady=(10, 0))
@@ -377,6 +384,7 @@ class App(ttk.Frame):
         for w in (self.from_entry, self.to_entry):
             w.configure(state=ranged)
         self.cues_cb.configure(state="disabled" if xml else "normal")
+        self.undo_btn.configure(state="disabled" if xml else "normal")
         energy = self.vars["energy"].get()
         self.energy_ratings_cb.configure(state="normal" if energy else "disabled")
         self.keep_ratings_cb.configure(
@@ -486,7 +494,7 @@ class App(ttk.Frame):
             opt.date_from, opt.date_to = self.date_from.get(), self.date_to.get()
         return opt
 
-    def start(self):
+    def start(self, preview: bool = False):
         xml_path = None
         if self.source.get() == "xml":
             xml_path = self.xml_path.get().strip()
@@ -503,13 +511,13 @@ class App(ttk.Frame):
             messagebox.showwarning(APP_NAME, str(exc))
             return
         self.save_settings()
-        if xml_path is None and not messagebox.askokcancel(
+        if not preview and xml_path is None and not messagebox.askokcancel(
                 APP_NAME, "This will update your rekordbox library directly.\n\n"
                           "Make sure rekordbox is closed. A backup of your library "
                           "is saved before anything is changed."):
             return
 
-        self.run_btn.configure(state="disabled")
+        self._busy(True)
         self.open_btn.grid_forget()
         self.log_box.configure(state="normal")
         self.log_box.delete("1.0", "end")
@@ -517,13 +525,21 @@ class App(ttk.Frame):
         self.progress.configure(mode="indeterminate", value=0)
         self.progress.start(12)
 
+        if preview:
+            self.log("Preview: working on a copy. Nothing in your library is changed.")
+
         def work():
             try:
+                changes = organizer.Changes()
                 out = organizer.run(
                     opt, xml_path,
                     log=lambda m: self.queue.put(("log", m)),
-                    progress=lambda done, total: self.queue.put(("progress", (done, total))))
-                self.queue.put(("done", (out, opt.folder_name, xml_path is not None)))
+                    progress=lambda done, total: self.queue.put(("progress", (done, total))),
+                    preview=preview, changes=changes)
+                if preview:
+                    self.queue.put(("preview", changes))
+                else:
+                    self.queue.put(("done", (out, opt.folder_name, xml_path is not None)))
             except Exception as exc:  # report anything to the user rather than crash
                 self.queue.put(("error", str(exc)))
 
@@ -542,6 +558,10 @@ class App(ttk.Frame):
                         self.progress.stop()
                         self.progress.configure(mode="determinate", maximum=total)
                     self.progress.configure(value=done)
+                elif kind == "preview":
+                    self.finish()
+                    self.show_preview(payload)
+                    return
                 elif kind == "done":
                     self.finish()
                     self.last_run = datetime.date.today().isoformat()
@@ -615,8 +635,8 @@ class App(ttk.Frame):
                           + (f"\n\nWhat's new:\n{notes}" if notes else "")):
             return
         self.save_settings()
-        for w in (self.update_btn, self.run_btn):
-            w.configure(state="disabled")
+        self.update_btn.configure(state="disabled")
+        self._busy(True)
         self.update_label.configure(text=f"Downloading version {info['version']} ...")
         self.progress.configure(mode="determinate", value=0, maximum=1)
         status: queue.Queue = queue.Queue()
@@ -641,7 +661,7 @@ class App(ttk.Frame):
                     else:
                         self.progress.configure(value=0)
                         self.update_btn.configure(state="normal")
-                        self.run_btn.configure(state="normal")
+                        self._busy(False)
                         self.update_label.configure(
                             text=f"Version {info['version']} is available.")
                         if messagebox.askyesno(
@@ -657,10 +677,101 @@ class App(ttk.Frame):
         threading.Thread(target=work, daemon=True).start()
         self.after(100, poll)
 
+    def _busy(self, busy: bool):
+        for w in (self.run_btn, self.preview_btn, self.undo_btn):
+            w.configure(state="disabled" if busy else "normal")
+        if not busy:
+            self._sync_states()
+
     def finish(self):
         self.progress.stop()
         self.progress.configure(mode="determinate", value=0)
-        self.run_btn.configure(state="normal")
+        self._busy(False)
+
+    # ------------------------------------------------------ preview / undo --
+
+    def show_preview(self, changes: organizer.Changes):
+        win = tk.Toplevel(self.master)
+        win.title(f"{APP_NAME} - Preview")
+        win.transient(self.master)
+        frame = ttk.Frame(win, padding=12)
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(1, weight=1)
+        ttk.Label(frame, text="This is what Run would change. Nothing has been changed yet.",
+                  font=("", 10, "bold")).grid(row=0, column=0, columnspan=2, sticky="w")
+        text = tk.Text(frame, width=100, height=28, wrap="none", relief="flat",
+                       borderwidth=1, highlightthickness=1)
+        bar = ttk.Scrollbar(frame, orient="vertical", command=text.yview)
+        text.configure(yscrollcommand=bar.set)
+        text.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
+        bar.grid(row=1, column=1, sticky="ns", pady=(8, 0))
+        text.insert("1.0", organizer.summarize_changes(changes))
+        text.configure(state="disabled")
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=2, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        ttk.Button(buttons, text="Close", command=win.destroy).pack(side="left")
+
+        def run_now():
+            win.destroy()
+            self.start()
+
+        if not changes.empty():
+            ttk.Button(buttons, text="Run now", command=run_now).pack(side="left", padx=(8, 0))
+
+    def undo(self):
+        import rbdb
+        try:
+            db_path = rbdb.library_path()
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, str(exc))
+            return
+        backups = rbdb.list_backups(os.path.dirname(db_path))
+        if not backups:
+            messagebox.showinfo(APP_NAME, "There's nothing to undo: no backups from this app "
+                                          "were found.")
+            return
+
+        win = tk.Toplevel(self.master)
+        win.title(f"{APP_NAME} - Undo")
+        win.transient(self.master)
+        frame = ttk.Frame(win, padding=12)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, wraplength=440, justify="left",
+                  text="Put your library back to how it was just before a run. Everything "
+                       "changed in rekordbox since then (by this app or by you) is undone too."
+                  ).pack(anchor="w")
+        ttk.Label(frame, text="Before the run on:", font=("", 9, "bold")).pack(anchor="w",
+                                                                               pady=(10, 2))
+        box = tk.Listbox(frame, height=min(len(backups), 6), exportselection=False)
+        for path in backups:
+            box.insert("end", rbdb.backup_time(path).strftime("%A %d %B %Y, %H:%M:%S"))
+        box.selection_set(0)
+        box.pack(fill="x")
+        ttk.Label(frame, foreground="gray", wraplength=440, justify="left",
+                  text="Your library as it is now is kept as a copy too, so this can be "
+                       "reversed.").pack(anchor="w", pady=(6, 0))
+        buttons = ttk.Frame(frame)
+        buttons.pack(anchor="e", pady=(10, 0))
+        ttk.Button(buttons, text="Cancel", command=win.destroy).pack(side="left")
+
+        def restore():
+            chosen = backups[box.curselection()[0]] if box.curselection() else backups[0]
+            if rbdb.rekordbox_running():
+                messagebox.showwarning(APP_NAME, "Please close rekordbox first.", parent=win)
+                return
+            try:
+                keep = rbdb.restore_backup(chosen, db_path)
+            except OSError as exc:
+                messagebox.showerror(APP_NAME, f"Couldn't restore the backup:\n{exc}", parent=win)
+                return
+            win.destroy()
+            self.log(f"Restored your library from {os.path.basename(chosen)}. "
+                     f"The version from before the undo is saved as {os.path.basename(keep)}.")
+            messagebox.showinfo(APP_NAME, "Done. Your library is back to how it was. "
+                                          "Open rekordbox to check.")
+
+        ttk.Button(buttons, text="Restore", command=restore).pack(side="left", padx=(8, 0))
 
     def reveal_output(self):
         if not self.output_path:

@@ -208,8 +208,14 @@ example, you added an "EDM" playlist and it's tagged EDM), it's moved there: tak
 of the old playlist and added to the new one. The log lists every move. Songs that
 still fit, or that fit none of your playlists (including ones you put somewhere by
 hand), stay where they are. Only your own playlists in the main folder are affected;
-a playlist you've removed from your list is left alone. Untick "move songs to the
-playlist they now fit best" in *My playlists* to turn this off.
+a playlist you've removed from your list is left alone.
+
+The folders the app makes itself (By Energy, Auto Genres, By BPM and the other extra
+playlists) are kept up to date the same way. A song whose energy went from 3 to 2 moves
+from "3 - Groove" to "2 - Warm-up", and a corrected BPM moves it to the right BPM
+playlist. Only folders you've ticked for this run are updated, and only for the songs
+being organized. Untick "move songs to the playlist they now fit best" in
+*My playlists* to turn all moving off.
 
 **Only new songs:** under "Songs to organize" pick *All*, *Added since last run* (the
 app remembers the date of each successful run), or *Added from … to …* (either date
@@ -221,17 +227,21 @@ consistent with earlier runs.
 
 ### Straight from rekordbox (default)
 
-1. **Close rekordbox.**
-2. Open Rekordbox Organizer, tick what you want, and press **Run**.
-3. Open rekordbox. The new folder is in your playlists, and ratings are updated.
+1. Open Rekordbox Organizer and tick what you want.
+2. Press **Preview** to see exactly what would change: songs moved, playlists created
+   or added to, star ratings and hot cues. Nothing is changed, and rekordbox can stay open.
+3. **Close rekordbox** and press **Run** (or **Run now** in the preview).
+4. Open rekordbox. The new folder is in your playlists, and ratings are updated.
 
 The app reads and writes rekordbox's own library database (rekordbox 6 and 7).
 Before changing anything it saves a backup next to the library, named
 `master.organizer-backup-<date>.db`. It keeps the 3 most recent backups.
 
-To undo a run: close rekordbox, rename your current `master.db`, and rename the
-backup to `master.db`. The library is in `%APPDATA%\Pioneer\rekordbox\` on Windows
-and `~/Library/Pioneer/rekordbox/` on macOS.
+**Undo:** close rekordbox, press **Undo last run...**, pick the run, and press
+**Restore**. Your library goes back to how it was just before that run. Anything you
+changed in rekordbox after it is undone too. Your library as it was before the undo is
+saved as `master.before-undo-<date>.db`, so you can change your mind. The library is in
+`%APPDATA%\Pioneer\rekordbox\` on Windows and `~/Library/Pioneer/rekordbox/` on macOS.
 
 ### From an XML export
 
