@@ -72,6 +72,9 @@ class Track:
     path: str         # local file path decoded from Location
     energy: int = 0   # 1-5 once analysed, 0 if unknown
     waveform: str = ""   # rekordbox analysis file (.EXT), direct mode only
+    length: int = 0      # seconds, 0 if unknown
+    size: int = 0        # file size in bytes, 0 if unknown
+    cues: int = 0        # hot cues and memory cues set on it
 
 
 @dataclass
@@ -97,7 +100,10 @@ class Options:
     energy: bool = False         # listen to the music and score energy 1-5
     energy_ratings: bool = True  # ...and set the star rating to the energy level
     keep_ratings: bool = True    # ...except on tracks that already have a rating
+    energy_tags: bool = False    # ...and/or tag it "Energy 1-5" in My Tag (direct mode)
     phrase_cues: bool = False    # hot cues where sections start (direct mode only)
+    cue_colours: bool = True     # ...coloured by section
+    memory_cues: bool = False    # memory cues where the intro ends / outro starts
     # Set builder: one playlist in mixable order following an energy curve.
     set_build: bool = False
     set_name: str = "My Set"
@@ -143,6 +149,7 @@ class Changes:
     removed: list = field(default_factory=list)   # (playlist, track id)
     cues: list = field(default_factory=list)      # (track id, pad, label, ms)
     genres: list = field(default_factory=list)    # (track id, old genre, new genre)
+    tags: list = field(default_factory=list)      # (track id, old energy tag, new)
     sets: list = field(default_factory=list)      # (playlist, [track ids in order], replaced)
     names: dict = field(default_factory=dict)     # track id -> song name, for showing them
 
@@ -210,6 +217,9 @@ def load_library(xml_path: str) -> tuple[ET.ElementTree, list[Track]]:
             date_added=a.get("DateAdded", ""),
             play_count=_int(a.get("PlayCount")),
             path=location_to_path(a.get("Location", "")),
+            length=_int(a.get("TotalTime")),
+            size=_int(a.get("Size")),
+            cues=len(el.findall("POSITION_MARK")),
         ))
     return tree, tracks
 
@@ -258,6 +268,82 @@ def _norm_title(s: str) -> str:
     s = re.sub(r"\(\s*original mix\s*\)", "", s)
     s = re.sub(r"[^\w]+", " ", s)
     return " ".join(s.split())
+
+
+# Junk that download sites and rippers add to titles; never part of the song's name.
+_TITLE_JUNK = re.compile(
+    r"^\s*\d{1,3}\s*[.\-)]\s+"                                # "12. ", "07 - "
+    r"|[\[(][^\])]*\b(?:free|download|dl|buy|out now)\b[^\])]*[\])]"  # "[FREE DL]"
+    r"|/?\s*'?buy'?\s*=\s*free\b.*$"                          # "/ 'Buy' = FREE MP3!"
+    r"|\b(?:free (?:download|dl|mp3))\b.*$"
+    r"|\.(?:mp3|m4a|wav|aiff?|flac)$", re.I)
+
+DUPLICATES_NAME = "Possible Duplicates"
+EXTRA_COPIES_NAME = "Duplicates - Extra Copies"
+LENGTH_SLACK = 2   # seconds two copies of a song may differ by
+
+
+def song_key(t: Track) -> tuple[str, str]:
+    """(artist, title) for spotting copies of one song: case, punctuation and junk ignored.
+
+    Mix names stay ("Extended Mix" and "Radio Edit" are different versions).
+    """
+    title = t.name
+    for _ in range(3):
+        cleaned = _TITLE_JUNK.sub("", title).strip()
+        if cleaned == title:
+            break
+        title = cleaned
+    return _norm_title(t.artist), _norm_title(title or t.name)
+
+
+def _keep_score(t: Track) -> tuple:
+    """Higher = the better copy to keep."""
+    present = bool(t.path) and os.path.exists(t.path)
+    return (present, t.cues, t.play_count, t.rating, bool(t.waveform), t.size,
+            # the older entry (it's what playlists and history point to), then a tidier path
+            [-ord(c) for c in t.date_added[:19]], -len(t.path))
+
+
+def find_duplicates(tracks: list[Track]) -> list[list[Track]]:
+    """Groups of copies of the same song, the copy to keep first.
+
+    Copies: the same artist and title (ignoring junk like track numbers and
+    "[FREE DL]") with lengths within LENGTH_SLACK seconds; or files of exactly
+    the same size and length.
+    """
+    parent = {t.id: t.id for t in tracks}
+
+    def root(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def join(a, b):
+        parent[root(a)] = root(b)
+
+    by_name: dict = defaultdict(list)
+    by_file: dict = defaultdict(list)
+    for t in tracks:
+        if t.name:
+            by_name[song_key(t)].append(t)
+        if t.size > 0 and t.length > 0:
+            by_file[(t.size, t.length)].append(t)
+    for same in by_name.values():
+        for i, a in enumerate(same):
+            for b in same[i + 1:]:
+                if not a.length or not b.length or abs(a.length - b.length) <= LENGTH_SLACK:
+                    join(a.id, b.id)
+    for same in by_file.values():
+        for b in same[1:]:
+            join(same[0].id, b.id)
+
+    groups: dict = defaultdict(list)
+    for t in tracks:
+        groups[root(t.id)].append(t)
+    found = [sorted(g, key=_keep_score, reverse=True) for g in groups.values() if len(g) > 1]
+    return sorted(found, key=lambda g: song_key(g[0]))
 
 
 def parse_date(text: str) -> str:
@@ -613,13 +699,10 @@ def build_plan(tracks: list[Track], opt: Options, rules: Optional[list[_Rule]] =
 
     cleanup: list[tuple[str, list[str]]] = []
     if opt.duplicates:
-        seen: dict = defaultdict(list)
-        for t in tracks:
-            if t.name:
-                seen[(_norm_title(t.artist), _norm_title(t.name))].append(t)
-        dupes = [t for k in sorted(seen) if len(seen[k]) > 1 for t in seen[k]]
-        if dupes:
-            cleanup.append(("Possible Duplicates", [t.id for t in dupes]))
+        groups = find_duplicates(tracks)
+        if groups:
+            cleanup.append((DUPLICATES_NAME, [t.id for g in groups for t in g]))
+            cleanup.append((EXTRA_COPIES_NAME, [t.id for g in groups for t in g[1:]]))
     if opt.missing_files:
         missing = [t.id for t in tracks if t.path and not os.path.exists(t.path)]
         if missing:
@@ -915,13 +998,23 @@ def _organize(tracks: list[Track], opt: Options, log: Callable[[str], None],
 
     by_guess: set = set()
     plan = build_plan(tracks, opt, rules, guesses, by_guess)
+    if opt.duplicates:
+        for group in find_duplicates(tracks):
+            keep = group[0]
+            for t in group[1:]:
+                if t.cues > keep.cues:
+                    missing = t.path and not os.path.exists(t.path)
+                    log(f"  Note: the extra copy of '{t.name}' has {t.cues} cues the kept copy "
+                        "doesn't" + (" (its file is missing, so it can't play)" if missing else "")
+                        + ". Copy them over in rekordbox before removing it.")
     if opt.set_build:
         req = set_request(opt)
         chain = setbuilder.build_set(library, req, guesses)   # from the whole library
         log(setbuilder.describe(chain, req))
         if chain:
             plan.append((SETS_FOLDER, [(req.name, [t.id for t in chain])]))
-    if not plan and not ratings and not opt.phrase_cues:
+    if (not plan and not ratings and not opt.phrase_cues and not opt.memory_cues
+            and not (opt.energy and opt.energy_tags)):
         raise ValueError("Nothing to do - tick at least one option.")
 
     shown_parents = set()
@@ -975,10 +1068,13 @@ def run(opt: Options, xml_path: Optional[str] = None, log: Callable[[str], None]
         log(f"Found {len(tracks)} tracks.")
         if not tracks:
             raise ValueError("The collection in this XML file is empty.")
-        if opt.phrase_cues:
-            log("Hot cues need rekordbox's phrase analysis, so they're only added when "
+        if opt.phrase_cues or opt.memory_cues:
+            log("Cues need rekordbox's phrase analysis, so they're only added when "
                 "working straight from rekordbox. Skipping them.")
-            opt = dataclasses.replace(opt, phrase_cues=False)
+            opt = dataclasses.replace(opt, phrase_cues=False, memory_cues=False)
+        if opt.energy_tags:
+            log("My Tags can only be written straight into rekordbox. Skipping them.")
+            opt = dataclasses.replace(opt, energy_tags=False)
         changes.names.update((t.id, t.name) for t in tracks)
         plan, ratings, chosen = _organize(tracks, opt, log, progress)
         out_path = default_output_path(xml_path)
@@ -1017,14 +1113,18 @@ def run(opt: Options, xml_path: Optional[str] = None, log: Callable[[str], None]
             raise ValueError("Your rekordbox collection is empty.")
         changes.names.update((t.id, t.name) for t in tracks)
         plan, ratings, chosen = _organize(tracks, opt, log, progress)
-        hot_cues = rbdb.plan_hot_cues(db, chosen, log) if opt.phrase_cues else {}
+        hot_cues = (rbdb.plan_hot_cues(db, chosen, log, opt.phrase_cues, opt.memory_cues)
+                    if opt.phrase_cues or opt.memory_cues else {})
 
         if not preview:
             if rbdb.rekordbox_running():
                 raise ValueError("rekordbox was opened while working. Nothing was changed - "
                                  "close rekordbox and press Run again.")
             log(f"Backed up your library to {os.path.basename(rbdb.backup(db_path))}")
-        rbdb.add_hot_cues(db, contents, hot_cues, log, changes)   # saved with the rest
+        rbdb.add_hot_cues(db, contents, hot_cues, log, changes,   # saved with the rest
+                          colours=opt.cue_colours)
+        if opt.energy and opt.energy_tags:
+            rbdb.write_energy_tags(db, {t.id: t.energy for t in chosen}, log, changes)
         counts = rbdb.write_changes(db, contents, plan, folder_name, ratings, log,
                                     opt.merge_existing, _evictor(plan, opt, chosen),
                                     changes, commit=not preview)
@@ -1098,6 +1198,12 @@ def summarize_changes(changes: Changes, names: Optional[dict[str, str]] = None) 
             lines.append(f"  {song(tid)}:  {was} -> {new} star{'s' if new != 1 else ''}")
         lines.append("")
 
+    if changes.tags:
+        lines.append(f"ENERGY MY TAGS ({len(changes.tags)} songs)")
+        for tid, old, new in changes.tags:
+            lines.append(f"  {song(tid)}:  {old or '(none)'} -> {new}")
+        lines.append("")
+
     if changes.genres:
         lines.append(f"GENRE TAGS ({len(changes.genres)} songs)")
         for tid, old, new in changes.genres:
@@ -1113,3 +1219,75 @@ def summarize_changes(changes: Changes, names: Optional[dict[str, str]] = None) 
             lines.append(f"  {song(tid)}:  " + ", ".join(cues))
         lines.append("")
     return "\n".join(lines).rstrip()
+
+
+@dataclass
+class GenreSuggestion:
+    id: str
+    name: str
+    artist: str
+    bpm: float
+    tag: str      # the genre it has now ("" if none)
+    guess: str    # the app's guess ("" if it couldn't tell)
+
+
+def genre_review(xml_path: Optional[str] = None, log: Callable[[str], None] = print,
+                 progress: Optional[Callable[[int, int], None]] = None
+                 ) -> tuple[list[GenreSuggestion], list[str]]:
+    """Guesses for every song with no genre or a vague one ("Dance & EDM"), to check by hand.
+
+    Returns (suggestions, genre names to offer: the app's genre families plus
+    the library's own specific tags). Only reads the library.
+    """
+    import genres
+    if xml_path:
+        _, tracks = load_library(xml_path)
+    else:
+        import rbdb
+        db = rbdb.open_database()
+        try:
+            tracks, _ = rbdb.load_tracks(db)
+        finally:
+            db.close()
+    choices: dict[str, str] = {fam.casefold(): fam for fam, _ in genres.FAMILIES}
+    for t in tracks:
+        tag = " ".join(t.genre.split())
+        if tag and not genres.is_vague(tag):
+            choices.setdefault(tag.casefold(), tag)
+    names = sorted(choices.values(), key=str.casefold)
+    vague = [t for t in tracks if genres.is_vague(t.genre)]
+    if not vague:
+        return [], names
+    features = analyse_tracks(tracks, log, progress)
+    guesses = genres.guess_genres(tracks, features, log)
+    return [GenreSuggestion(t.id, t.name, t.artist, t.bpm, t.genre, guesses.get(t.id, ""))
+            for t in sorted(vague, key=lambda t: (t.artist.casefold(), t.name.casefold()))], names
+
+
+def save_genres(new: dict[str, str], log: Callable[[str], None] = print,
+                preview: bool = False, changes: Optional[Changes] = None) -> str:
+    """Write {track id: genre} into rekordbox (backed up first). Returns the library path."""
+    import rbdb
+    if not preview and rbdb.rekordbox_running():
+        raise ValueError("rekordbox is open. Please close it first, then save again.")
+    db = rbdb.open_database()
+    db_path = rbdb.database_path(db)
+    work = None
+    if preview:
+        real, (db, work) = db, rbdb.open_preview_copy(db)
+        real.close()
+    try:
+        _, contents = rbdb.load_tracks(db)
+        if not preview:
+            log(f"Backed up your library to {os.path.basename(rbdb.backup(db_path))}")
+        rbdb.write_genres(db, contents, new, log, changes)
+        if preview:
+            db.rollback()
+        else:
+            db.commit()
+        return db_path
+    finally:
+        db.close()
+        if work:
+            import shutil
+            shutil.rmtree(work, ignore_errors=True)

@@ -137,5 +137,46 @@ class UndoTests(unittest.TestCase):
         self.assertEqual(rbdb.backup_time(backups[-1]).year, 2020)
 
 
+def song(i, name, artist="", length=200, size=0, path="", plays=0, cues=0, added="2026-01-01"):
+    return organizer.Track(str(i), name, artist, "", "", 124.0, "", 0, 0, "", added, plays, path,
+                           length=length, size=size, cues=cues)
+
+
+class DuplicateTests(unittest.TestCase):
+    def ids(self, tracks):
+        return [[t.id for t in g] for g in organizer.find_duplicates(tracks)]
+
+    def test_junk_in_titles_is_ignored(self):
+        for junk in ("12. Latch (Lost Kings Remix)", "Latch (Lost Kings Remix) [FREE DL]",
+                     "Latch (Lost Kings Remix) / 'Buy' = FREE MP3!", "latch (lost kings remix).mp3"):
+            self.assertEqual(organizer.song_key(song(1, junk))[1], "latch lost kings remix", junk)
+        # Mix names are part of the song.
+        self.assertNotEqual(organizer.song_key(song(1, "Latch (Extended Mix)")),
+                            organizer.song_key(song(2, "Latch (Radio Edit)")))
+
+    def test_same_song_needs_a_similar_length(self):
+        tracks = [song(1, "Latch", length=238), song(2, "LATCH", length=239),
+                  song(3, "Latch", length=300)]                 # a different edit
+        self.assertEqual(self.ids(tracks), [["1", "2"]])
+
+    def test_same_file_under_another_name(self):
+        tracks = [song(1, "Track 07", size=4900489, length=238),
+                  song(2, "Latch", size=4900489, length=238), song(3, "Other", size=1, length=9)]
+        self.assertEqual(sorted(self.ids(tracks)[0]), ["1", "2"])
+
+    def test_keeps_the_copy_with_cues_then_plays_then_the_older_one(self):
+        self.assertEqual(self.ids([song(1, "A"), song(2, "A", cues=3)]), [["2", "1"]])
+        self.assertEqual(self.ids([song(1, "A", plays=1), song(2, "A")]), [["1", "2"]])
+        self.assertEqual(self.ids([song(1, "A", added="2026-02-01"),
+                                   song(2, "A", added="2026-01-01")]), [["2", "1"]])
+
+    def test_cleanup_playlists(self):
+        tracks = [song(1, "A"), song(2, "A", plays=2), song(3, "B")]
+        plan = dict(organizer.build_plan(tracks, organizer.Options(duplicates=True,
+                                                                   guess_genres=False)))
+        self.assertEqual(dict(plan["Cleanup"]), {organizer.DUPLICATES_NAME: ["2", "1"],
+                                                 organizer.EXTRA_COPIES_NAME: ["1"]})
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -27,6 +27,16 @@ PRIORITY = {"Drop": 5, "Chorus": 5, "Build-up": 4, "Breakdown": 3, "Bridge": 3,
 PADS = "ABCDEFGH"
 MIN_GAP_MS = 1000   # don't put a cue this close to one that's already there
 
+# Hot cue colour per section. rekordbox stores a cue's colour as a number in its
+# hot cue palette (DjmdCue.ColorTableIndex); PALETTE maps names to those numbers.
+SECTION_COLOURS = {"Drop": "red", "Chorus": "red", "Build-up": "orange",
+                   "Breakdown": "blue", "Bridge": "blue", "Verse": "yellow",
+                   "Intro": "green", "Outro": "green"}
+PALETTE: dict[str, int] = {}
+
+MIX_IN, MIX_OUT = "Mix in", "Mix out"
+MIN_MIX_IN_MS = 8000   # a shorter intro needs no cue: the track start does the job
+
 
 @dataclass
 class Phrase:
@@ -86,3 +96,25 @@ def choose_hot_cues(phrases: list[Phrase], used_pads: set[int],
         best = sorted(wanted, key=lambda p: (-PRIORITY.get(p.label, 0), p.start_ms))
         wanted = sorted(best[:len(free)], key=lambda p: p.start_ms)
     return list(zip(free, wanted))
+
+
+def colour_index(label: str):
+    """The palette number for a section's hot cue colour, or None for no colour."""
+    return PALETTE.get(SECTION_COLOURS.get(label, ""))
+
+
+def choose_memory_cues(phrases: list[Phrase], existing_ms: list[int]) -> list[Phrase]:
+    """Memory cues where a mix usually starts and ends.
+
+    Mix in: where the intro ends (the first section after it), unless that is
+    within MIN_MIX_IN_MS of the start.
+    Mix out: where the outro starts.
+    Nothing is added within MIN_GAP_MS of a memory cue that's already there.
+    """
+    picks = []
+    if len(phrases) > 1 and phrases[0].label == "Intro" and phrases[1].start_ms >= MIN_MIX_IN_MS:
+        picks.append(Phrase(phrases[1].start_ms, MIX_IN))
+    outros = [p for p in phrases[1:] if p.label == "Outro"]
+    if outros:
+        picks.append(Phrase(outros[-1].start_ms, MIX_OUT))
+    return [p for p in picks if all(abs(p.start_ms - ms) >= MIN_GAP_MS for ms in existing_ms)]

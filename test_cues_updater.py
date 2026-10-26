@@ -42,6 +42,27 @@ class ChooseHotCueTests(unittest.TestCase):
         self.assertEqual(cues.read_phrases("nope/ANLZ0000.EXT"), [])
 
 
+class MemoryCueTests(unittest.TestCase):
+    def test_mix_in_and_out(self):
+        phrases = [Phrase(0, "Intro"), Phrase(30000, "Build-up"), Phrase(60000, "Drop"),
+                   Phrase(150000, "Outro")]
+        self.assertEqual(cues.choose_memory_cues(phrases, []),
+                         [Phrase(30000, cues.MIX_IN), Phrase(150000, cues.MIX_OUT)])
+        # Already there (within a second): nothing new.
+        self.assertEqual(cues.choose_memory_cues(phrases, [30400, 149800]), [])
+
+    def test_no_intro_or_outro(self):
+        self.assertEqual(cues.choose_memory_cues([Phrase(0, "Drop"), Phrase(9000, "Verse")], []),
+                         [])
+        short_intro = [Phrase(0, "Intro"), Phrase(3000, "Drop")]
+        self.assertEqual(cues.choose_memory_cues(short_intro, []), [])
+
+    def test_colours(self):
+        with mock.patch.dict(cues.PALETTE, {"red": 7}, clear=True):
+            self.assertEqual(cues.colour_index("Drop"), 7)
+            self.assertIsNone(cues.colour_index("Intro"))   # no colour known: none set
+
+
 class _Resp(io.BytesIO):
     def __init__(self, payload: bytes):
         super().__init__(payload)

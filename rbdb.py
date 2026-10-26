@@ -76,6 +76,9 @@ def load_tracks(db) -> tuple[list[Track], dict]:
     """Return (tracks, {track id: DjmdContent})."""
     from pyrekordbox.masterdb import models
     tracks, contents = [], {}
+    cue_counts: dict[str, int] = {}
+    for cue in db.query(models.DjmdCue.ContentID).filter(models.DjmdCue.rb_local_deleted == 0):
+        cue_counts[str(cue.ContentID)] = cue_counts.get(str(cue.ContentID), 0) + 1
     query = db.query(models.DjmdContent).filter(models.DjmdContent.rb_local_deleted == 0)
     for c in query:
         folder = (c.FolderPath or "").replace("\\", "/").casefold()
@@ -102,6 +105,9 @@ def load_tracks(db) -> tuple[list[Track], dict]:
             play_count=_int(c.DJPlayCount),
             path=os.path.normpath(c.FolderPath) if c.FolderPath else "",
             waveform=waveform if waveform and os.path.exists(waveform) else "",
+            length=_int(c.Length),
+            size=_int(c.FileSize),
+            cues=cue_counts.get(str(c.ID), 0),
         ))
         contents[str(c.ID)] = c
     return tracks, contents
@@ -369,21 +375,155 @@ def write_changes(db, contents: dict, plan: Plan, folder_name: str,
     return created, updated, added, removed
 
 
+def write_genres(db, contents: dict, new: dict[str, str], log: Callable[[str], None] = print,
+                 changes=None) -> int:
+    """Set track genres: {track id: genre name}. Returns how many changed.
+
+    An existing rekordbox genre with the same name (ignoring capitals) is reused,
+    so "house" goes in as your existing "House".
+    """
+    from pyrekordbox.masterdb import models
+
+    genres = {}
+    for g in db.query(models.DjmdGenre).all():
+        if g.Name:
+            genres.setdefault(" ".join(g.Name.split()).casefold(), g)
+    changed = 0
+    now = datetime.datetime.now()
+    for track_id, name in new.items():
+        name = " ".join(name.split())
+        content = contents.get(track_id)
+        if not name or content is None:
+            continue
+        genre = genres.get(name.casefold())
+        if genre is None:
+            genre = db.add_genre(name)
+            genres[name.casefold()] = genre
+        if str(content.GenreID or "") == str(genre.ID):
+            continue
+        if changes is not None:
+            changes.genres.append((track_id, (content.GenreName or "").strip(), genre.Name))
+        content.GenreID, content.updated_at = genre.ID, now
+        changed += 1
+    log(f"Saved the genre of {changed} track{'s' if changed != 1 else ''}.")
+    return changed
+
+
+# My Tag: rekordbox has four tag columns (DjmdMyTag rows with Attribute 1 under
+# "root"), each holding tags (Attribute 0). Energy goes in a column named
+# "Energy", as tags "Energy 1" ... "Energy 5".
+ENERGY_COLUMN = "Energy"
+SPARE_COLUMN = "Untitled Column"   # rekordbox's name for the column it leaves empty
+
+
+def energy_tag_column(db, log: Callable[[str], None] = print):
+    """The "Energy" My Tag column, taking over the spare one if needed; None if impossible."""
+    from pyrekordbox.masterdb import models
+
+    columns = [c for c in db.query(models.DjmdMyTag).filter(
+        models.DjmdMyTag.ParentID == "root", models.DjmdMyTag.Attribute == 1,
+        models.DjmdMyTag.rb_local_deleted == 0)]
+    for c in columns:
+        if same_name(c.Name, ENERGY_COLUMN):
+            return c
+    for c in columns:
+        if same_name(c.Name, SPARE_COLUMN):
+            tags = [t.ID for t in db.query(models.DjmdMyTag).filter(
+                models.DjmdMyTag.ParentID == c.ID, models.DjmdMyTag.rb_local_deleted == 0)]
+            used = tags and db.query(models.DjmdSongMyTag).filter(
+                models.DjmdSongMyTag.MyTagID.in_(tags),
+                models.DjmdSongMyTag.rb_local_deleted == 0).count()
+            if not used:
+                c.Name, c.updated_at = ENERGY_COLUMN, datetime.datetime.now()
+                log(f"Renamed your unused My Tag column '{SPARE_COLUMN}' to '{ENERGY_COLUMN}'.")
+                return c
+    log("Energy My Tags skipped: all your My Tag columns are in use. In rekordbox, rename "
+        f"one to '{ENERGY_COLUMN}' and run again.")
+    return None
+
+
+def write_energy_tags(db, levels: dict[str, int], log: Callable[[str], None] = print,
+                      changes=None) -> None:
+    """Tag each track with "Energy <level>" (one per track; old levels are taken off)."""
+    from pyrekordbox.masterdb import models
+
+    column = energy_tag_column(db, log)
+    if column is None or not levels:
+        return
+    now = datetime.datetime.now()
+    tags = {t.Name: t for t in db.query(models.DjmdMyTag).filter(
+        models.DjmdMyTag.ParentID == column.ID, models.DjmdMyTag.rb_local_deleted == 0)}
+    seq = max((t.Seq or 0 for t in tags.values()), default=0)
+    for level in range(1, 6):
+        name = f"Energy {level}"
+        if name not in tags:
+            seq += 1
+            tags[name] = models.DjmdMyTag.create(
+                ID=str(db.generate_unused_id(models.DjmdMyTag, is_28_bit=False)), Seq=seq,
+                Name=name, Attribute=0, ParentID=column.ID, UUID=str(uuid4()),
+                created_at=now, updated_at=now)
+            db.add(tags[name])
+            db.flush()
+    by_id = {t.ID: name for name, t in tags.items() if name.startswith("Energy ")}
+
+    current: dict[str, list] = {}
+    counts: dict[str, int] = {}
+    for row in db.query(models.DjmdSongMyTag).filter(
+            models.DjmdSongMyTag.MyTagID.in_(list(by_id)),
+            models.DjmdSongMyTag.rb_local_deleted == 0):
+        current.setdefault(str(row.ContentID), []).append(row)
+        counts[row.MyTagID] = max(counts.get(row.MyTagID, 0), row.TrackNo or 0)
+
+    changed = 0
+    for track_id, level in levels.items():
+        if not level:
+            continue
+        want = tags[f"Energy {level}"].ID
+        rows = current.get(str(track_id), [])
+        if [r.MyTagID for r in rows] == [want]:
+            continue
+        for r in rows:
+            if r.MyTagID != want:
+                db.delete(r)
+        if all(r.MyTagID != want for r in rows):
+            counts[want] = counts.get(want, 0) + 1
+            db.add(models.DjmdSongMyTag.create(
+                ID=str(uuid4()), MyTagID=want, ContentID=str(track_id), TrackNo=counts[want],
+                UUID=str(uuid4()), created_at=now, updated_at=now))
+        if changes is not None:
+            old = ", ".join(sorted(by_id[r.MyTagID] for r in rows)) or ""
+            changes.tags.append((str(track_id), old, f"Energy {level}"))
+        changed += 1
+    db.flush()
+    log(f"Energy My Tags: updated {changed} track{'s' if changed != 1 else ''}.")
+
+
 # Hot cue pads A-H as stored in DjmdCue.Kind (0 is a memory cue; there's no 4).
 # Checked against hot cues made in rekordbox 7: those live only in master.db
 # (the ANLZ files' cue tags stay empty), with InFrame = InMsec * 150 // 1000.
 HOT_CUE_KINDS = (1, 2, 3, 5, 6, 7, 8, 9)
 
 
-def plan_hot_cues(db, tracks: list[Track], log: Callable[[str], None] = print) -> dict:
-    """{track id: [(pad 0-7, Phrase)]} for the hot cues to add, from phrase analysis."""
+MEMORY_CUE = 0
+
+
+def plan_hot_cues(db, tracks: list[Track], log: Callable[[str], None] = print,
+                  hot: bool = True, memory: bool = False) -> dict:
+    """{track id: [(DjmdCue.Kind, Phrase)]} for the cues to add, from phrase analysis.
+
+    hot: hot cues where sections start, in empty pads. memory: memory cues
+    where the intro ends and the outro starts.
+    """
     import cues
     from pyrekordbox.masterdb import models
 
-    hot: dict[str, list] = {}
+    existing_hot: dict[str, list] = {}
+    existing_memory: dict[str, list] = {}
     for c in db.query(models.DjmdCue).filter(models.DjmdCue.rb_local_deleted == 0):
         if c.Kind in HOT_CUE_KINDS:
-            hot.setdefault(str(c.ContentID), []).append(c)
+            existing_hot.setdefault(str(c.ContentID), []).append(c)
+        elif c.Kind == MEMORY_CUE:
+            existing_memory.setdefault(str(c.ContentID), []).append(_int(c.InMsec))
 
     plan, unanalysed, done = {}, 0, 0
     for t in tracks:
@@ -391,15 +531,23 @@ def plan_hot_cues(db, tracks: list[Track], log: Callable[[str], None] = print) -
         if not phrases:
             unanalysed += 1
             continue
-        existing = hot.get(t.id, [])
-        picks = cues.choose_hot_cues(phrases, {HOT_CUE_KINDS.index(c.Kind) for c in existing},
-                                     [_int(c.InMsec) for c in existing])
+        picks = []
+        if hot:
+            have = existing_hot.get(t.id, [])
+            picks += [(HOT_CUE_KINDS[pad], p) for pad, p in cues.choose_hot_cues(
+                phrases, {HOT_CUE_KINDS.index(c.Kind) for c in have},
+                [_int(c.InMsec) for c in have])]
+        if memory:
+            picks += [(MEMORY_CUE, p) for p in
+                      cues.choose_memory_cues(phrases, existing_memory.get(t.id, []))]
         if picks:
             plan[t.id] = picks
         else:
             done += 1
-    added = sum(len(p) for p in plan.values())
-    log(f"Hot cues: {added} to add on {len(plan)} track{'s' if len(plan) != 1 else ''}"
+    n_hot = sum(kind != MEMORY_CUE for p in plan.values() for kind, _ in p)
+    n_memory = sum(kind == MEMORY_CUE for p in plan.values() for kind, _ in p)
+    parts = ([f"{n_hot} hot cues"] if hot else []) + ([f"{n_memory} memory cues"] if memory else [])
+    log(f"Cues: {' and '.join(parts)} to add on {len(plan)} track{'s' if len(plan) != 1 else ''}"
         + (f"; {done} already have them or no empty pads" if done else "") + ".")
     if unanalysed:
         log(f"  {unanalysed} track{'s have' if unanalysed != 1 else ' has'} no phrase analysis. "
@@ -409,28 +557,32 @@ def plan_hot_cues(db, tracks: list[Track], log: Callable[[str], None] = print) -
 
 
 def add_hot_cues(db, contents: dict, plan: dict, log: Callable[[str], None] = print,
-                 changes=None) -> None:
-    """Add the planned hot cues (saved by the next commit)."""
+                 changes=None, colours: bool = False) -> None:
+    """Add the planned cues (saved by the next commit). colours: colour hot cues by section."""
+    import cues
     from pyrekordbox.masterdb import models
 
     now = datetime.datetime.now()
     taken: set[int] = set()     # IDs handed out but not yet in the database
     for track_id, picks in plan.items():
         content = contents[track_id]
-        for pad, phrase in picks:
+        for kind, phrase in picks:
             cue_id = db.generate_unused_id(models.DjmdCue, is_28_bit=False)
             while cue_id in taken:
                 cue_id = db.generate_unused_id(models.DjmdCue, is_28_bit=False)
             taken.add(cue_id)
             ms = int(phrase.start_ms)
+            memory = kind == MEMORY_CUE
+            colour = None if memory or not colours else cues.colour_index(phrase.label)
             if changes is not None:
-                changes.cues.append((track_id, "ABCDEFGH"[pad], phrase.label, ms))
-            # Same fields rekordbox fills in for a hot cue set on a pad.
+                where = "Memory" if memory else cues.PADS[HOT_CUE_KINDS.index(kind)]
+                changes.cues.append((track_id, where, phrase.label, ms))
+            # Same fields rekordbox fills in for a cue set by hand.
             db.add(models.DjmdCue.create(
                 ID=str(cue_id), ContentID=str(content.ID), ContentUUID=content.UUID,
                 InMsec=ms, InFrame=ms * 150 // 1000, InMpegFrame=0, InMpegAbs=0,
                 OutMsec=-1, OutFrame=0, OutMpegFrame=0, OutMpegAbs=0,
-                Kind=HOT_CUE_KINDS[pad], Color=-1, Comment=phrase.label,
+                Kind=kind, Color=-1, ColorTableIndex=colour, Comment=phrase.label,
                 UUID=str(uuid4()), created_at=now, updated_at=now))
     if plan:
-        log(f"Added {sum(len(p) for p in plan.values())} hot cues.")
+        log(f"Added {sum(len(p) for p in plan.values())} cues.")
