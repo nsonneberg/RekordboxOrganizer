@@ -102,6 +102,9 @@ class PlaylistRow:
 
 
 class App(ttk.Frame):
+    TABS = ("Library", "My playlists", "Extra playlists", "Energy", "Cues", "Genres",
+            "Set builder")
+
     def __init__(self, master: tk.Tk):
         super().__init__(master, padding=16)
         self.master = master
@@ -115,15 +118,26 @@ class App(ttk.Frame):
         self.date_from = tk.StringVar()
         self.date_to = tk.StringVar()
         self.last_run = ""                               # YYYY-MM-DD of the last successful run
+        self.tab = 0
         defaults = organizer.Options(custom_enabled=True)
         self.vars = {name: tk.BooleanVar(value=getattr(defaults, name)) for name in (
             "custom_enabled", "custom_leftovers", "guess_genres", "auto_genres", "merge_existing",
             "move_mismatched",
-            "energy", "energy_ratings", "keep_ratings", "phrase_cues",
+            "energy", "energy_ratings", "keep_ratings", "energy_tags",
+            "phrase_cues", "cue_colours", "memory_cues", "set_build",
             "genre", "bpm", "key", "artist", "label", "year", "rating", "colour",
             "date_added", "duplicates", "missing_files", "missing_info", "never_played")}
-        self.bpm_step = tk.IntVar(value=defaults.bpm_step)
-        self.min_tracks = tk.IntVar(value=defaults.min_tracks)
+        # Other settings, saved as they are: {Options field: Tk variable}
+        self.values = {
+            "bpm_step": tk.IntVar(value=defaults.bpm_step),
+            "min_tracks": tk.IntVar(value=defaults.min_tracks),
+            "set_name": tk.StringVar(value=defaults.set_name),
+            "set_start": tk.IntVar(value=defaults.set_start),
+            "set_end": tk.IntVar(value=defaults.set_end),
+            "set_length": tk.IntVar(value=defaults.set_length),
+            "set_genres": tk.StringVar(value=defaults.set_genres),
+            "set_bpm": tk.StringVar(value=defaults.set_bpm),
+        }
         self.playlist_count = tk.IntVar(value=len(EXAMPLE_PLAYLISTS))
         self.rows: list[PlaylistRow] = []
         # Remembers rows removed by lowering the count, so raising it brings them back.
@@ -134,14 +148,25 @@ class App(ttk.Frame):
         self.grid(sticky="nsew")
         master.columnconfigure(0, weight=1)
         master.rowconfigure(0, weight=1)
-        for var in (self.source, self.vars["energy"], self.vars["energy_ratings"],
-                    self.vars["custom_enabled"], self.date_mode, self.vars["merge_existing"]):
+        for var in (self.source, self.date_mode, *self.vars.values()):
             var.trace_add("write", lambda *_: self._sync_states())
         self.playlist_count.trace_add("write", lambda *_: self._resize_rows())
         self._sync_states()
         master.protocol("WM_DELETE_WINDOW", self.on_close)
 
     # ------------------------------------------------------------------ UI --
+
+    def _check(self, parent, key, text, row, col=0, **kw):
+        cb = ttk.Checkbutton(parent, text=text, variable=self.vars[key])
+        cb.grid(row=row, column=col, sticky="w", pady=2, **kw)
+        return cb
+
+    @staticmethod
+    def _hint(parent, text, row, col=0, **kw):
+        label = ttk.Label(parent, text=text, foreground="gray", wraplength=640, justify="left")
+        label.grid(row=row, column=col, columnspan=kw.pop("columnspan", 1), sticky="w",
+                   pady=kw.pop("pady", (2, 6)), **kw)
+        return label
 
     def _build(self):
         self.columnconfigure(0, weight=1)
@@ -164,100 +189,28 @@ class App(ttk.Frame):
         self.update_bar.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(6, 0))
         self.update_bar.grid_remove()
 
-        # Step 1 - library
-        step1 = ttk.LabelFrame(self, text=" 1. Your rekordbox library ", padding=10)
-        step1.grid(sticky="ew", pady=(12, 0))
-        step1.columnconfigure(0, weight=1)
-        ttk.Radiobutton(step1, text="Straight from rekordbox (close rekordbox first)",
-                        variable=self.source, value="direct").grid(row=0, column=0, columnspan=2, sticky="w")
-        ttk.Radiobutton(step1, text="From an XML export file",
-                        variable=self.source, value="xml").grid(row=1, column=0, columnspan=2, sticky="w")
-        self.xml_entry = ttk.Entry(step1, textvariable=self.xml_path)
-        self.xml_entry.grid(row=2, column=0, sticky="ew", padx=(22, 0), pady=(4, 0))
-        self.browse_btn = ttk.Button(step1, text="Browse...", command=self.browse)
-        self.browse_btn.grid(row=2, column=1, padx=(8, 0), pady=(4, 0))
-        self.source_hint = ttk.Label(step1, foreground="gray")
-        self.source_hint.grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
-
-        dates = ttk.Frame(step1)
-        dates.grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        ttk.Label(dates, text="Songs to organize:").grid(row=0, column=0, sticky="w")
-        ttk.Radiobutton(dates, text="All", variable=self.date_mode,
-                        value="all").grid(row=0, column=1, padx=(8, 0))
-        self.since_rb = ttk.Radiobutton(dates, variable=self.date_mode, value="since_last")
-        self.since_rb.grid(row=0, column=2, padx=(8, 0))
-        ttk.Radiobutton(dates, text="Added from", variable=self.date_mode,
-                        value="range").grid(row=0, column=3, padx=(8, 0))
-        self.from_entry = ttk.Entry(dates, textvariable=self.date_from, width=11)
-        self.from_entry.grid(row=0, column=4, padx=(4, 0))
-        ttk.Label(dates, text="to").grid(row=0, column=5, padx=4)
-        self.to_entry = ttk.Entry(dates, textvariable=self.date_to, width=11)
-        self.to_entry.grid(row=0, column=6)
-        ttk.Label(dates, text="(YYYY-MM-DD, either can be empty)", foreground="gray"
-                  ).grid(row=0, column=7, padx=(6, 0))
-
-        def check(parent, key, text, row, col, **kw):
-            cb = ttk.Checkbutton(parent, text=text, variable=self.vars[key])
-            cb.grid(row=row, column=col, sticky="w", pady=2, **kw)
-            return cb
-
-        # Steps 2 and 3 side by side
-        middle = ttk.Frame(self)
-        middle.grid(sticky="ew", pady=(12, 0))
-        middle.columnconfigure(0, weight=1, uniform="half")
-        middle.columnconfigure(1, weight=1, uniform="half")
-
-        step2 = ttk.LabelFrame(middle, text=" 2. Energy ", padding=10)
-        step2.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
-        check(step2, "energy", "Rate each song's energy 1-5", 0, 0)
-        self.energy_ratings_cb = check(step2, "energy_ratings",
-                                       "Set its star rating to the energy level",
-                                       1, 0, padx=(22, 0))
-        self.keep_ratings_cb = check(step2, "keep_ratings",
-                                     "Keep ratings I've already set",
-                                     2, 0, padx=(44, 0))
-        ttk.Label(step2, foreground="gray",
-                  text="Judged in each track's drops. 5 stars = your most energetic 20%, 1 = calmest. Uses "
-                       "rekordbox's own track analysis.",
-                  wraplength=360, justify="left").grid(row=3, column=0, sticky="w", pady=(4, 0))
-
-        step3 = ttk.LabelFrame(middle, text=" 3. Genres ", padding=10)
-        step3.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
-        check(step3, "guess_genres", "Guess genres for untagged / vague songs", 0, 0)
-        check(step3, "auto_genres", "Auto genre detection (a folder per genre)", 1, 0)
-        ttk.Label(step3, foreground="gray", wraplength=360, justify="left",
-                  text="rekordbox doesn't detect genre, so guesses are estimates from BPM and "
-                       "sound, learned from your tagged songs. Guessed songs go in "
-                       "'(detected)' playlists so you can check them."
-                  ).grid(row=2, column=0, sticky="w", pady=(4, 0))
-
-        cue_box = ttk.LabelFrame(self, text=" Hot cues ", padding=(10, 4))
-        cue_box.grid(sticky="ew", pady=(12, 0))
-        self.cues_cb = check(cue_box, "phrase_cues",
-                             "Add hot cues where sections start (Intro, Build-up, Drop, "
-                             "Breakdown, Chorus, Outro)", 0, 0)
-        ttk.Label(cue_box, foreground="gray", wraplength=760, justify="left",
-                  text="Uses rekordbox's phrase analysis. Only empty pads (A-H) are used and "
-                       "your own hot cues are never moved. Works straight from rekordbox only."
-                  ).grid(row=1, column=0, sticky="w")
-
-        # Step 4 - playlists (tabs)
-        ttk.Label(self, text="4. Playlists", font=("", 10, "bold")).grid(sticky="w", pady=(12, 2))
-        tabs = ttk.Notebook(self)
-        tabs.grid(sticky="ew")
-        tabs.add(self._build_custom_tab(tabs, check), text="  My playlists  ")
-        tabs.add(self._build_auto_tab(tabs, check), text="  Extra playlists (optional)  ")
+        self.tabs = ttk.Notebook(self)
+        self.tabs.grid(sticky="nsew", pady=(12, 0))
+        for name, build in zip(self.TABS, (
+                self._tab_library, self._tab_custom, self._tab_auto, self._tab_energy,
+                self._tab_cues, self._tab_genres, self._tab_set)):
+            frame = ttk.Frame(self.tabs, padding=12)
+            frame.columnconfigure(0, weight=1)
+            build(frame)
+            self.tabs.add(frame, text=f"  {name}  ")
+        try:
+            self.tabs.select(self.tab)
+        except tk.TclError:
+            pass
 
         # Run row
         run_row = ttk.Frame(self)
-        run_row.grid(sticky="ew", pady=(14, 0))
-        run_row.columnconfigure(2, weight=1)
-        ttk.Label(run_row, text="Main folder name:").grid(row=0, column=0)
-        ttk.Entry(run_row, textvariable=self.folder_name, width=18).grid(row=0, column=1, padx=(6, 0))
-        check(run_row, "merge_existing", "Add to existing folders / playlists with the same name",
-              0, 2, padx=(12, 0))
+        run_row.grid(sticky="ew", pady=(12, 0))
+        run_row.columnconfigure(0, weight=1)
+        self.summary = ttk.Label(run_row, foreground="gray")
+        self.summary.grid(row=0, column=0, sticky="w")
         buttons = ttk.Frame(run_row)
-        buttons.grid(row=0, column=3, sticky="e")
+        buttons.grid(row=0, column=1, sticky="e")
         self.undo_btn = ttk.Button(buttons, text="Undo last run...", command=self.undo)
         self.undo_btn.pack(side="left")
         self.preview_btn = ttk.Button(buttons, text="Preview", width=10,
@@ -270,20 +223,54 @@ class App(ttk.Frame):
         self.progress.grid(sticky="ew", pady=(10, 0))
 
         # Log
-        self.log_box = tk.Text(self, height=6, wrap="word", state="disabled",
+        self.log_box = tk.Text(self, height=7, wrap="word", state="disabled",
                                relief="flat", borderwidth=1, highlightthickness=1)
         self.log_box.grid(sticky="nsew", pady=(10, 0))
         self.rowconfigure(self.log_box.grid_info()["row"], weight=1)
 
         self.open_btn = ttk.Button(self, text="Show output file", command=self.reveal_output)
 
-    def _build_custom_tab(self, tabs, check) -> ttk.Frame:
-        tab = ttk.Frame(tabs, padding=10)
-        tab.columnconfigure(0, weight=1)
+    def _tab_library(self, tab):
+        ttk.Radiobutton(tab, text="Straight from rekordbox (close rekordbox before pressing Run)",
+                        variable=self.source, value="direct").grid(row=0, column=0, columnspan=2,
+                                                                   sticky="w")
+        ttk.Radiobutton(tab, text="From an XML export file",
+                        variable=self.source, value="xml").grid(row=1, column=0, columnspan=2,
+                                                                sticky="w")
+        self.xml_entry = ttk.Entry(tab, textvariable=self.xml_path)
+        self.xml_entry.grid(row=2, column=0, sticky="ew", padx=(22, 0), pady=(4, 0))
+        self.browse_btn = ttk.Button(tab, text="Browse...", command=self.browse)
+        self.browse_btn.grid(row=2, column=1, padx=(8, 0), pady=(4, 0))
+        self.source_hint = self._hint(tab, "", 3, columnspan=2)
 
+        dates = ttk.Frame(tab)
+        dates.grid(row=4, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        ttk.Label(dates, text="Songs to organize:").grid(row=0, column=0, sticky="w")
+        ttk.Radiobutton(dates, text="All", variable=self.date_mode,
+                        value="all").grid(row=0, column=1, padx=(8, 0))
+        self.since_rb = ttk.Radiobutton(dates, variable=self.date_mode, value="since_last")
+        self.since_rb.grid(row=0, column=2, padx=(8, 0))
+        ttk.Radiobutton(dates, text="Added from", variable=self.date_mode,
+                        value="range").grid(row=0, column=3, padx=(8, 0))
+        self.from_entry = ttk.Entry(dates, textvariable=self.date_from, width=11)
+        self.from_entry.grid(row=0, column=4, padx=(4, 0))
+        ttk.Label(dates, text="to").grid(row=0, column=5, padx=4)
+        self.to_entry = ttk.Entry(dates, textvariable=self.date_to, width=11)
+        self.to_entry.grid(row=0, column=6)
+        self._hint(tab, "Dates as YYYY-MM-DD; either can be empty. The rest of the library is "
+                        "still read for comparison.", 5, columnspan=2)
+
+        folder = ttk.Frame(tab)
+        folder.grid(row=6, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        ttk.Label(folder, text="Main folder name:").pack(side="left")
+        ttk.Entry(folder, textvariable=self.folder_name, width=20).pack(side="left", padx=(6, 0))
+        self._check(tab, "merge_existing", "Add to existing folders / playlists with the same "
+                                          "name (instead of replacing them)", 7)
+
+    def _tab_custom(self, tab):
         top = ttk.Frame(tab)
         top.grid(sticky="ew")
-        check(top, "custom_enabled", "Sort my library into these playlists", 0, 0)
+        self._check(top, "custom_enabled", "Sort my library into these playlists", 0)
         count_row = ttk.Frame(top)
         count_row.grid(row=0, column=1, sticky="e", padx=(16, 0))
         ttk.Label(count_row, text="How many:").pack(side="left")
@@ -291,7 +278,7 @@ class App(ttk.Frame):
                                       textvariable=self.playlist_count)
         self.count_spin.pack(side="left", padx=(4, 0))
 
-        self.rows_frame = ScrollFrame(tab, height=120)
+        self.rows_frame = ScrollFrame(tab, height=150)
         self.rows_frame.grid(sticky="ew", pady=(8, 0))
         self.rows_frame.sync_background(ttk.Style())
         inner = self.rows_frame.inner
@@ -301,50 +288,126 @@ class App(ttk.Frame):
         inner.columnconfigure(2, weight=2)
         self._resize_rows()
 
-        self.leftovers_cb = check(tab, "custom_leftovers",
-                                  f"Also make an '{organizer.LEFTOVERS_NAME}' playlist for songs "
-                                  "that fit nowhere", 2, 0)
-        self.move_cb = check(tab, "move_mismatched",
-                             "When adding to existing playlists, move songs to the playlist "
-                             "they now fit best", 3, 0)
-        ttk.Label(tab, foreground="gray", wraplength=760, justify="left",
-                  text="A song is added only if it matches every rule you fill in; songs that "
-                       "don't fit are left alone. Genre is relaxed: 'house' also catches "
-                       "Progressive House, Tech-House, Deep House... and, with guessing on, "
-                       "untagged songs that sound like house. If a song fits several "
-                       "playlists it goes to the best genre match. "
-                       "BPM: 120-126, 128+ or 174. Energy (1-5): 4-5, 3+ or 2."
-                  ).grid(row=4, column=0, sticky="w", pady=(4, 0))
-        return tab
+        self.leftovers_cb = self._check(tab, "custom_leftovers",
+                                        f"Also make an '{organizer.LEFTOVERS_NAME}' playlist for "
+                                        "songs that fit nowhere", 2)
+        self.move_cb = self._check(tab, "move_mismatched",
+                                   "When adding to existing playlists, move songs to the "
+                                   "playlist they now fit best", 3)
+        self._hint(tab, "A song is added only if it matches every rule you fill in. Genre is "
+                        "relaxed: 'house' also catches Tech-House, Deep House... and, with "
+                        "guessing on, untagged songs that sound like house. "
+                        "BPM: 120-126, 128+ or 174. Energy (1-5): 4-5, 3+ or 2.", 4)
 
-    def _build_auto_tab(self, tabs, check) -> ttk.Frame:
-        tab = ttk.Frame(tabs, padding=10)
+    def _tab_auto(self, tab):
         for c in range(2):
             tab.columnconfigure(c, weight=1)
-        check(tab, "genre", "Genre", 0, 0)
+        self._check(tab, "genre", "Genre", 0, 0)
         bpm_row = ttk.Frame(tab)
         bpm_row.grid(row=0, column=1, sticky="w")
         ttk.Checkbutton(bpm_row, text="BPM range, every", variable=self.vars["bpm"]).pack(side="left")
-        ttk.Spinbox(bpm_row, from_=1, to=20, width=3, textvariable=self.bpm_step).pack(side="left", padx=4)
+        ttk.Spinbox(bpm_row, from_=1, to=20, width=3,
+                    textvariable=self.values["bpm_step"]).pack(side="left", padx=4)
         ttk.Label(bpm_row, text="BPM").pack(side="left")
-        check(tab, "key", "Key (Camelot)", 1, 0)
-        check(tab, "year", "Release year", 1, 1)
-        check(tab, "artist", "Artist", 2, 0)
-        check(tab, "label", "Record label", 2, 1)
-        check(tab, "rating", "Star rating", 3, 0)
-        check(tab, "colour", "Track color", 3, 1)
-        check(tab, "date_added", "Month added", 4, 0)
+        self._check(tab, "key", "Key (Camelot)", 1, 0)
+        self._check(tab, "year", "Release year", 1, 1)
+        self._check(tab, "artist", "Artist", 2, 0)
+        self._check(tab, "label", "Record label", 2, 1)
+        self._check(tab, "rating", "Star rating", 3, 0)
+        self._check(tab, "colour", "Track color", 3, 1)
+        self._check(tab, "date_added", "Month added", 4, 0)
         min_row = ttk.Frame(tab)
         min_row.grid(row=4, column=1, sticky="w")
         ttk.Label(min_row, text="Artist/label needs at least").pack(side="left")
-        ttk.Spinbox(min_row, from_=1, to=50, width=3, textvariable=self.min_tracks).pack(side="left", padx=4)
+        ttk.Spinbox(min_row, from_=1, to=50, width=3,
+                    textvariable=self.values["min_tracks"]).pack(side="left", padx=4)
         ttk.Label(min_row, text="tracks").pack(side="left")
-        ttk.Label(tab, text="Cleanup:", font=("", 9, "bold")).grid(row=5, column=0, sticky="w", pady=(8, 0))
-        check(tab, "duplicates", "Possible duplicates", 6, 0)
-        check(tab, "missing_files", "Missing files", 6, 1)
-        check(tab, "missing_info", "Missing genre / key / BPM", 7, 0)
-        check(tab, "never_played", "Never played", 7, 1)
-        return tab
+        ttk.Label(tab, text="Cleanup:", font=("", 9, "bold")).grid(row=5, column=0, sticky="w",
+                                                                  pady=(10, 0))
+        self._check(tab, "duplicates", "Duplicates (and which copies to remove)", 6, 0)
+        self._check(tab, "missing_files", "Missing files", 6, 1)
+        self._check(tab, "missing_info", "Missing genre / key / BPM", 7, 0)
+        self._check(tab, "never_played", "Never played", 7, 1)
+        self._hint(tab, f"'{organizer.EXTRA_COPIES_NAME}' lists the copies you can remove: for "
+                        "each song the playable copy with the most cues and plays is kept. In "
+                        "rekordbox, select them and choose 'Remove from Collection'. The app "
+                        "never deletes anything.", 8, columnspan=2)
+
+    def _tab_energy(self, tab):
+        self._check(tab, "energy", "Rate each song's energy 1-5", 0)
+        self.energy_ratings_cb = self._check(tab, "energy_ratings",
+                                             "Set its star rating to the energy level", 1,
+                                             padx=(22, 0))
+        self.keep_ratings_cb = self._check(tab, "keep_ratings", "Keep ratings I've already set",
+                                           2, padx=(44, 0))
+        self.energy_tags_cb = self._check(tab, "energy_tags",
+                                          "Tag it 'Energy 1-5' in My Tag (your stars stay yours "
+                                          "if you untick the star rating)", 3, padx=(22, 0))
+        self._hint(tab, "Judged in each track's drops and choruses with rekordbox's own "
+                        "analysis. 5 = your most energetic 20%, 1 = your calmest. A 'By Energy' "
+                        "folder is made too. My Tags go in a column named 'Energy' (rekordbox's "
+                        "unused 'Untitled Column' is renamed if needed) and need 'Straight from "
+                        "rekordbox'.", 4)
+
+    def _tab_cues(self, tab):
+        self.cues_cb = self._check(tab, "phrase_cues",
+                                   "Hot cues where sections start (Intro, Build-up, Drop, "
+                                   "Breakdown, Chorus, Outro)", 0)
+        self.colours_cb = self._check(tab, "cue_colours",
+                                      "Colour them by section (drops red, build-ups orange, "
+                                      "breakdowns blue, intro/outro green)", 1, padx=(22, 0))
+        self.memory_cb = self._check(tab, "memory_cues",
+                                     "Memory cues to mix in (where the intro ends) and mix out "
+                                     "(where the outro starts)", 2)
+        self._hint(tab, "Uses rekordbox's phrase analysis (Preferences > Analysis > Phrase). "
+                        "Only empty pads (A-H) are used, your own cues are never moved, and "
+                        "running again doesn't add the same cue twice. Works straight from "
+                        "rekordbox only.", 3)
+
+    def _tab_genres(self, tab):
+        self._check(tab, "guess_genres", "Guess genres for untagged / vague songs", 0)
+        self._check(tab, "auto_genres", "Auto genre detection (a folder per genre)", 1)
+        self._hint(tab, "rekordbox doesn't detect genre, so guesses are estimates from BPM and "
+                        "sound, learned from your tagged songs. Guessed songs go in "
+                        "'(detected)' playlists so you can check them.", 2)
+        row = ttk.Frame(tab)
+        row.grid(row=3, column=0, sticky="w", pady=(10, 0))
+        self.review_btn = ttk.Button(row, text="Review genres...", command=self.review_genres)
+        self.review_btn.pack(side="left")
+        ttk.Label(row, text="Check the guesses and save the right genres into rekordbox.",
+                  foreground="gray").pack(side="left", padx=(10, 0))
+        self._hint(tab, "Saved genres become real tags, so every later guess learns from them.", 4)
+
+    def _tab_set(self, tab):
+        self._check(tab, "set_build", "Build a set: one playlist in mixable order", 0)
+        form = ttk.Frame(tab)
+        form.grid(row=1, column=0, sticky="w", padx=(22, 0), pady=(4, 0))
+        self.set_widgets = []
+
+        def field(label, widget, row, col, hint=""):
+            ttk.Label(form, text=label).grid(row=row, column=col, sticky="w", pady=3,
+                                             padx=(0 if col == 0 else 18, 6))
+            widget.grid(row=row, column=col + 1, sticky="w", pady=3)
+            if hint:
+                ttk.Label(form, text=hint, foreground="gray").grid(row=row, column=col + 2,
+                                                                   sticky="w", padx=(6, 0))
+            self.set_widgets.append(widget)
+
+        v = self.values
+        field("Name:", ttk.Entry(form, textvariable=v["set_name"], width=20), 0, 0)
+        field("Songs:", ttk.Spinbox(form, from_=2, to=200, width=5,
+                                    textvariable=v["set_length"]), 0, 2)
+        field("Start energy:", ttk.Spinbox(form, from_=1, to=5, width=5,
+                                           textvariable=v["set_start"]), 1, 0)
+        field("End energy:", ttk.Spinbox(form, from_=1, to=5, width=5,
+                                         textvariable=v["set_end"]), 1, 2)
+        field("Genre has:", ttk.Entry(form, textvariable=v["set_genres"], width=20), 2, 0)
+        field("BPM:", ttk.Entry(form, textvariable=v["set_bpm"], width=10), 2, 2, "e.g. 120-128")
+        self._hint(tab, "Picks songs from your whole library so each one mixes into the next: "
+                        "a compatible key (Camelot wheel), a BPM within a few percent, and "
+                        "energy moving from the start level to the end level. The set goes in "
+                        f"'{organizer.SETS_FOLDER}' and is rewritten each run. Leave Genre and "
+                        "BPM empty for any.", 2, pady=(8, 0))
 
     def _resize_rows(self):
         try:
@@ -369,33 +432,55 @@ class App(ttk.Frame):
                 self.row_memory.append(row.get())
 
     def _sync_states(self):
-        if not hasattr(self, "leftovers_cb"):   # still building the window
+        if not hasattr(self, "set_widgets"):   # still building the window
             return
+        on = lambda flag: "normal" if flag else "disabled"
+        v = {k: var.get() for k, var in self.vars.items()}
         xml = self.source.get() == "xml"
         for w in (self.xml_entry, self.browse_btn):
-            w.configure(state="normal" if xml else "disabled")
+            w.configure(state=on(xml))
         self.source_hint.configure(text=(
             "In rekordbox: File > Export Collection in xml format, then pick that file."
             if xml else
             "Reads and updates your rekordbox library directly. A backup is made first."))
         self.since_rb.configure(text=f"Added since last run ({self.last_run})"
                                 if self.last_run else "Added since last run (none yet)")
-        ranged = "normal" if self.date_mode.get() == "range" else "disabled"
         for w in (self.from_entry, self.to_entry):
-            w.configure(state=ranged)
-        self.cues_cb.configure(state="disabled" if xml else "normal")
-        self.undo_btn.configure(state="disabled" if xml else "normal")
-        energy = self.vars["energy"].get()
-        self.energy_ratings_cb.configure(state="normal" if energy else "disabled")
-        self.keep_ratings_cb.configure(
-            state="normal" if energy and self.vars["energy_ratings"].get() else "disabled")
-        custom = "normal" if self.vars["custom_enabled"].get() else "disabled"
+            w.configure(state=on(self.date_mode.get() == "range"))
+        self.cues_cb.configure(state=on(not xml))
+        self.memory_cb.configure(state=on(not xml))
+        self.colours_cb.configure(state=on(not xml and v["phrase_cues"]))
+        self.undo_btn.configure(state=on(not xml))
+        self.energy_ratings_cb.configure(state=on(v["energy"]))
+        self.keep_ratings_cb.configure(state=on(v["energy"] and v["energy_ratings"]))
+        self.energy_tags_cb.configure(state=on(v["energy"] and not xml))
+        custom = on(v["custom_enabled"])
         self.count_spin.configure(state=custom)
         self.leftovers_cb.configure(state=custom)
-        self.move_cb.configure(state=custom if self.vars["merge_existing"].get() else "disabled")
+        self.move_cb.configure(state=on(v["merge_existing"]))
         for row in self.rows:
             for w in row.widgets[1:]:
                 w.configure(state=custom)
+        for w in self.set_widgets:
+            w.configure(state=on(v["set_build"]))
+
+        # What Run will do, in a few words, so it shows from any tab.
+        doing = []
+        if v["custom_enabled"]:
+            doing.append("my playlists")
+        extras = ("genre", "bpm", "key", "artist", "label", "year", "rating", "colour",
+                  "date_added", "duplicates", "missing_files", "missing_info", "never_played")
+        if any(v[k] for k in extras) or v["auto_genres"]:
+            doing.append("extra playlists")
+        if v["energy"]:
+            doing.append("energy" + (" + stars" if v["energy_ratings"] else "")
+                         + (" + My Tag" if v["energy_tags"] and not xml else ""))
+        if not xml and (v["phrase_cues"] or v["memory_cues"]):
+            doing.append("cues")
+        if v["set_build"]:
+            doing.append("a set")
+        self.summary.configure(text=("Run will do: " + ", ".join(doing)) if doing
+                               else "Nothing ticked yet.")
 
     # ------------------------------------------------------------ settings --
 
@@ -420,9 +505,17 @@ class App(ttk.Frame):
                 var.set(data[key])
         if isinstance(data.get("last_run"), str):
             self.last_run = data["last_run"]
-        for var, key in ((self.bpm_step, "bpm_step"), (self.min_tracks, "min_tracks")):
-            if isinstance(data.get(key), int):
-                var.set(data[key])
+        if isinstance(data.get("tab"), int):
+            self.tab = data["tab"]
+        values = dict(data.get("values", {}))
+        for key in ("bpm_step", "min_tracks"):      # saved at the top level before 1.2
+            values.setdefault(key, data.get(key))
+        for key, var in self.values.items():
+            value = values.get(key)
+            if isinstance(var, tk.IntVar) and isinstance(value, int) and not isinstance(value, bool):
+                var.set(value)
+            elif isinstance(var, tk.StringVar) and isinstance(value, str):
+                var.set(value)
         playlists = data.get("playlists")
         if isinstance(playlists, list) and playlists:
             try:
@@ -444,8 +537,8 @@ class App(ttk.Frame):
             "date_from": self.date_from.get(),
             "date_to": self.date_to.get(),
             "last_run": self.last_run,
-            "bpm_step": self._int(self.bpm_step, 5),
-            "min_tracks": self._int(self.min_tracks, 3),
+            "tab": self._current_tab(),
+            "values": self._values(),
             "playlists": [vars(p) for p in rows],
         }
         try:
@@ -474,17 +567,27 @@ class App(ttk.Frame):
         self.log_box.see("end")
         self.log_box.configure(state="disabled")
 
-    @staticmethod
-    def _int(var: tk.IntVar, fallback: int) -> int:
+    def _current_tab(self) -> int:
         try:
-            return max(1, int(var.get()))
-        except (tk.TclError, ValueError):
-            return fallback
+            return self.tabs.index(self.tabs.select())
+        except (AttributeError, tk.TclError):
+            return self.tab
+
+    def _values(self) -> dict:
+        """The non-tickbox settings; a number box being typed in falls back to its default."""
+        defaults = organizer.Options()
+        out = {}
+        for key, var in self.values.items():
+            try:
+                out[key] = var.get()
+            except (tk.TclError, ValueError):
+                out[key] = getattr(defaults, key)
+        for key in ("bpm_step", "min_tracks"):
+            out[key] = max(1, out[key])
+        return out
 
     def collect_options(self) -> organizer.Options:
-        opt = organizer.Options(**{k: v.get() for k, v in self.vars.items()})
-        opt.bpm_step = self._int(self.bpm_step, 5)
-        opt.min_tracks = self._int(self.min_tracks, 3)
+        opt = organizer.Options(**{k: v.get() for k, v in self.vars.items()}, **self._values())
         opt.custom = [row.get() for row in self.rows]
         opt.folder_name = self.folder_name.get().strip() or "Organized"
         mode = self.date_mode.get()
@@ -504,9 +607,10 @@ class App(ttk.Frame):
         opt = self.collect_options()
         try:
             organizer.compile_custom(opt)    # catch typos in the rules right away
-            if xml_path:
-                opt.phrase_cues = False
             organizer.select_tracks([], opt)  # ...and in the dates
+            if opt.set_build:
+                import setbuilder
+                setbuilder.check(organizer.set_request(opt))
         except ValueError as exc:
             messagebox.showwarning(APP_NAME, str(exc))
             return
@@ -583,6 +687,156 @@ class App(ttk.Frame):
         except queue.Empty:
             pass
         self.after(50, self.poll)
+
+    # -------------------------------------------------------------- genres --
+
+    def review_genres(self):
+        xml_path = None
+        if self.source.get() == "xml":
+            xml_path = self.xml_path.get().strip()
+            if not xml_path or not os.path.isfile(xml_path):
+                messagebox.showwarning(APP_NAME, "Please choose your rekordbox XML file first.")
+                return
+        self._busy(True)
+        self.review_btn.configure(state="disabled")
+        self.log("Looking for songs with no genre or a vague one ...")
+        self.progress.configure(mode="indeterminate")
+        self.progress.start(12)
+        found: queue.Queue = queue.Queue()
+
+        def work():
+            try:
+                found.put(("ok", organizer.genre_review(
+                    xml_path, log=lambda m: found.put(("log", m)))))
+            except Exception as exc:
+                found.put(("error", str(exc)))
+
+        def wait():
+            try:
+                while True:
+                    kind, payload = found.get_nowait()
+                    if kind == "log":
+                        self.log(payload)
+                        continue
+                    self.finish()
+                    self.review_btn.configure(state="normal")
+                    if kind == "error":
+                        messagebox.showerror(APP_NAME, payload)
+                    elif not payload[0]:
+                        messagebox.showinfo(APP_NAME, "Every song already has a specific genre.")
+                    else:
+                        self.show_genre_review(*payload, can_save=xml_path is None)
+                    return
+            except queue.Empty:
+                self.after(100, wait)
+
+        threading.Thread(target=work, daemon=True).start()
+        self.after(100, wait)
+
+    def show_genre_review(self, rows, choices: list[str], can_save: bool):
+        win = tk.Toplevel(self.master)
+        win.title(f"{APP_NAME} - Review genres")
+        win.transient(self.master)
+        frame = ttk.Frame(win, padding=12)
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(1, weight=1)
+        ttk.Label(frame, wraplength=760, justify="left",
+                  text="These songs have no genre or a vague one. 'Save as' starts as the "
+                       "app's guess: select songs and pick the right genre, or Clear the ones "
+                       "you'd rather leave alone. Copies of a song change together."
+                  ).grid(row=0, column=0, columnspan=2, sticky="w")
+
+        cols = ("song", "artist", "bpm", "tag", "guess", "save")
+        tree = ttk.Treeview(frame, columns=cols, show="headings", height=16)
+        for col, text, width in (("song", "Song", 300), ("artist", "Artist", 140),
+                                 ("bpm", "BPM", 50), ("tag", "Genre now", 110),
+                                 ("guess", "Guess", 100), ("save", "Save as", 120)):
+            tree.heading(col, text=text)
+            tree.column(col, width=width, anchor="e" if col == "bpm" else "w",
+                        stretch=col == "song")
+        bar = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=bar.set)
+        tree.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
+        bar.grid(row=1, column=1, sticky="ns", pady=(8, 0))
+
+        save_as = {r.id: r.guess for r in rows}
+        by_id = {r.id: r for r in rows}
+        copies: dict = {}
+        for r in rows:
+            key = organizer.song_key(organizer.Track(r.id, r.name, r.artist, "", "", r.bpm, "",
+                                                     0, 0, "", "", 0, ""))
+            copies.setdefault(key, []).append(r.id)
+        copies_of = {i: ids for ids in copies.values() for i in ids}
+        for r in rows:
+            tree.insert("", "end", iid=r.id, values=(
+                r.name, r.artist, f"{r.bpm:.0f}" if r.bpm else "", r.tag or "(none)",
+                r.guess or "?", r.guess))
+
+        controls = ttk.Frame(frame)
+        controls.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        ttk.Label(controls, text="Genre for the selected songs:").pack(side="left")
+        genre = tk.StringVar()
+        ttk.Combobox(controls, textvariable=genre, values=choices, width=22).pack(side="left",
+                                                                                  padx=(6, 0))
+        count = ttk.Label(frame, foreground="gray")
+        count.grid(row=3, column=0, sticky="w", pady=(8, 0))
+
+        def refresh():
+            for i, value in save_as.items():
+                tree.set(i, "save", value)
+            n = sum(1 for v in save_as.values() if v.strip())
+            count.configure(text=f"{n} of {len(rows)} songs will be saved.")
+            save_btn.configure(state="normal" if n and can_save else "disabled")
+
+        def selected():
+            return {c for i in tree.selection() for c in copies_of.get(i, [i])}
+
+        def apply(value):
+            for i in selected():
+                save_as[i] = value
+            refresh()
+
+        ttk.Button(controls, text="Apply", command=lambda: apply(genre.get().strip())
+                   ).pack(side="left", padx=(6, 0))
+        ttk.Button(controls, text="Clear", command=lambda: apply("")).pack(side="left",
+                                                                          padx=(6, 0))
+        ttk.Button(controls, text="Use the guesses for all",
+                   command=lambda: (save_as.update({r.id: r.guess for r in rows}), refresh())
+                   ).pack(side="left", padx=(18, 0))
+
+        def pick_up(_event=None):
+            ids = list(tree.selection())
+            if ids:
+                genre.set(save_as.get(ids[0]) or by_id[ids[0]].guess)
+
+        tree.bind("<<TreeviewSelect>>", pick_up)
+
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=3, column=0, columnspan=2, sticky="e", pady=(8, 0))
+        ttk.Button(buttons, text="Close", command=win.destroy).pack(side="left")
+
+        def save():
+            new = {i: v.strip() for i, v in save_as.items() if v.strip()}
+            if not messagebox.askokcancel(
+                    APP_NAME, f"Save the genre of {len(new)} songs into rekordbox?\n\n"
+                              "Make sure rekordbox is closed. A backup of your library is "
+                              "saved first, and Undo last run can put it back.", parent=win):
+                return
+            try:
+                organizer.save_genres(new, log=self.log)
+            except Exception as exc:
+                messagebox.showerror(APP_NAME, str(exc), parent=win)
+                return
+            win.destroy()
+            messagebox.showinfo(APP_NAME, "Saved. Open rekordbox to see the new genres.")
+
+        save_btn = ttk.Button(buttons, text="Save to rekordbox", command=save)
+        save_btn.pack(side="left", padx=(8, 0))
+        if not can_save:
+            ttk.Label(frame, foreground="gray", text="Saving needs 'Straight from rekordbox' "
+                      "on the Library tab.").grid(row=4, column=0, sticky="w")
+        refresh()
 
     # ------------------------------------------------------------- updates --
 

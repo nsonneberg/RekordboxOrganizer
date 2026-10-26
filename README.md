@@ -163,6 +163,14 @@ than empty pads, drops and build-ups win. Works straight from rekordbox only, no
 an XML export. Tracks need phrase analysis, which is on by default; otherwise turn on
 **Preferences → Analysis → Phrase** in rekordbox and re-analyse them.
 
+The hot cues can be **coloured by section**: drops and choruses red, build-ups orange,
+breakdowns and bridges blue, verses yellow, intro and outro green.
+
+**Mix-in and mix-out memory cues:** a memory cue where the intro ends (where you'd
+usually bring the next track in) and one where the outro starts (where you'd start
+mixing out). Intros shorter than 8 seconds get no mix-in cue, since the start of the
+track already does that job. Like hot cues, they're never doubled up on a re-run.
+
 **Energy:** judges each track by its drops and choruses (found with rekordbox's phrase
 analysis), not by intros and breakdowns. Without phrase analysis, the loudest stretches
 are used. It measures:
@@ -197,10 +205,41 @@ Artist · Record label · Release year · Star rating · Track color · Month ad
 
 **Cleanup playlists:** Possible duplicates · Missing files · Missing genre / key / BPM · Never played
 
+**Duplicates:** copies of a song are found by name, ignoring track numbers and
+download junk like "[FREE DL]", with lengths within 2 seconds. Identical files count
+too. Mix names still matter, so an Extended Mix and a Radio Edit aren't duplicates.
+"Possible Duplicates" shows every copy. "Duplicates - Extra Copies" holds only the
+copies you can remove: for each song, the copy kept is the one whose file exists and
+that has the most cues and plays. In rekordbox, select everything in that playlist and
+choose **Remove from Collection**. The app never deletes anything. If a copy you'd
+remove has cues the kept copy lacks, the log tells you.
+
 Everything goes into one playlist folder (named "Organized" by default). If you run
 the app again, it **adds to** folders and playlists that already have the same name
 (ignoring capitals): new songs go at the end, and songs already there aren't added
 twice. Untick "Add to existing folders / playlists" to replace the folder instead.
+
+**Set builder:** builds one playlist in play order from your whole library. Pick a
+name, a length, a start and end energy (e.g. 2 → 5 for a warm-up into peak time), and
+optionally a genre and BPM range. Each song is chosen so it mixes into the one
+before: a compatible key on the Camelot wheel (same key, one step round, or the
+relative major/minor), a BPM within a few percent (half and double time count), and
+an energy close to where the set should be at that point. Sets go in the **Sets**
+folder and are rewritten in order each time you run, rather than added to. The log
+mentions any key clashes or big BPM jumps it couldn't avoid. Energy needs to be
+measured for this, which happens automatically.
+
+**Energy in My Tag:** tick "Tag it 'Energy 1-5' in My Tag" to put each song's level in
+rekordbox's My Tag. Untick the star rating option too if you want to keep stars for
+your own ratings. The tags go in a My Tag column named **Energy**. If you don't have
+one, rekordbox's unused "Untitled Column" is renamed, but only if no song uses it. Old
+levels are taken off when a song's energy changes. Works straight from rekordbox only.
+
+**Review genres:** on the Genres tab, **Review genres...** lists every song with no
+genre or a vague one ("Dance & EDM", "Electronic") next to the app's guess. Select
+songs, pick the right genre, and press **Save to rekordbox** (close rekordbox first; a
+backup is made). Copies of a song change together, and an existing genre with the same
+name is reused. Saved genres become real tags, so later guesses learn from them.
 
 **Songs move when they fit better:** when you re-run, songs already in your playlists
 are checked again. If a song now fits a *different* one of your playlists best (for
@@ -227,7 +266,9 @@ consistent with earlier runs.
 
 ### Straight from rekordbox (default)
 
-1. Open Rekordbox Organizer and tick what you want.
+1. Open Rekordbox Organizer and tick what you want on each tab (Library, My
+   playlists, Extra playlists, Energy, Cues, Genres, Set builder). The line next to
+   the Run button sums up what's ticked.
 2. Press **Preview** to see exactly what would change: songs moved, playlists created
    or added to, star ratings and hot cues. Nothing is changed, and rekordbox can stay open.
 3. **Close rekordbox** and press **Run** (or **Run now** in the preview).
