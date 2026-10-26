@@ -217,7 +217,7 @@ class App(ttk.Frame):
                                      "Keep ratings I've already set",
                                      2, 0, padx=(44, 0))
         ttk.Label(step2, foreground="gray",
-                  text="1 = calmest 20% of your library, 5 = most energetic 20%. Uses "
+                  text="Judged in each track's drops. 5 stars = your most energetic 20%, 1 = calmest. Uses "
                        "rekordbox's own track analysis.",
                   wraplength=360, justify="left").grid(row=3, column=0, sticky="w", pady=(4, 0))
 

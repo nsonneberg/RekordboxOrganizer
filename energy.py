@@ -23,11 +23,17 @@ from typing import Callable, Optional
 
 import numpy as np
 
-CACHE_VERSION = 2   # 2: added 'lows'
-FEATURES = ("loudness", "flux", "brightness", "highs")   # used for energy
-# Measurements also include "lows" (bass share), used for genre detection.
-WEIGHTS = {"loudness": 0.30, "flux": 0.30, "highs": 0.15, "brightness": 0.10, "bpm": 0.15}
+CACHE_VERSION = 3   # 2: added 'lows'; 3: energy measured in the drops (e_*)
+# Energy features. "loudness", "flux", "brightness", "highs" and "lows" are
+# whole-track measurements kept for genre guessing.
+FEATURES = ("e_loud", "e_punch", "e_power", "e_bass", "e_highs")
+WEIGHTS = {"e_loud": 0.24, "e_punch": 0.20, "e_power": 0.14, "e_bass": 0.10,
+           "e_highs": 0.10, "tempo": 0.17, "mood": 0.05}
+MAIN_SECTIONS = ("Drop", "Chorus")      # where a track's energy is judged
+# rekordbox often measures these at half speed (87 instead of 174 BPM)
+DOUBLE_TIME = ("drum and bass", "dnb", "jungle", "dubstep", "neurofunk", "liquid")
 
+WAVEFORM_RATE = 150    # PWV5 waveform entries per second
 MAX_SECONDS = 420      # analyse at most 7 minutes of each track
 FRAME = 2048
 
@@ -115,12 +121,22 @@ def measure(samples: np.ndarray, sr: int) -> dict:
     flux = np.maximum(np.diff(log_spec, axis=0), 0).mean(axis=1)
     flux = np.concatenate([[0.0], flux])
 
+    lows = power[:, freqs < 150].sum(axis=1) / total
+    highs = power[:, freqs >= 5000].sum(axis=1) / total
+    main = db >= np.percentile(db, 60)  # the loudest stretches stand in for the drops
     return {
         "loudness": float(db[body].mean()),
         "flux": float(flux[body].mean()),
         "brightness": float(((power * freqs).sum(axis=1) / total)[body].mean()),
-        "highs": float((power[:, freqs >= 5000].sum(axis=1) / total)[body].mean()),
-        "lows": float((power[:, freqs < 150].sum(axis=1) / total)[body].mean()),
+        "highs": float(highs[body].mean()),
+        "lows": float(lows[body].mean()),
+        # energy (same meaning as in measure_waveform)
+        "e_loud": float(np.percentile(db[main], 75)),
+        "e_punch": float(flux[main].mean()),
+        "e_power": float((db >= np.percentile(db, 95) - 3).mean()),
+        "e_bass": float((lows * rms)[main].mean()),
+        "e_highs": float(highs[main].mean()),
+        "mood": 0,
     }
 
 
@@ -157,7 +173,12 @@ def read_waveform(ext_path: str) -> np.ndarray:
     raise ValueError("no colour waveform in analysis file")
 
 
-def measure_waveform(entries: np.ndarray) -> dict:
+def measure_waveform(entries: np.ndarray, sections: Optional[list] = None, mood: int = 0) -> dict:
+    """Features from a PWV5 colour waveform (150 entries a second).
+
+    sections: [(start s, end s)] of the track's drops / choruses, from
+    rekordbox's phrase analysis; without them the loudest stretches stand in.
+    """
     height = ((entries >> 2) & 0x1F).astype(float)
     low = ((entries >> 13) & 7).astype(float)
     mid = ((entries >> 10) & 7).astype(float)
@@ -168,13 +189,39 @@ def measure_waveform(entries: np.ndarray) -> dict:
     body = sounding & (height >= np.median(height[sounding]))   # skip intros / breakdowns
     total = low + mid + high + 1e-9
     flux = np.maximum(np.diff(height, prepend=height[0]), 0)
+
+    main = np.zeros_like(sounding)
+    for start, end in sections or []:
+        main[int(start * WAVEFORM_RATE):int(end * WAVEFORM_RATE)] = True
+    main &= sounding
+    if main.sum() < WAVEFORM_RATE * 4:       # no usable phrase analysis
+        main = sounding & (height >= np.percentile(height[sounding], 60))
+    peak = np.percentile(height[sounding], 95)
     return {
         "loudness": float(height[body].mean()),
         "flux": float(flux[body].mean()),
         "brightness": float(((mid + 2 * high) / total)[body].mean()),
         "highs": float((high / total)[body].mean()),
         "lows": float((low / total)[body].mean()),
+        # energy, judged in the drops
+        "e_loud": float(np.percentile(height[main], 75)),
+        "e_punch": float(flux[main].mean() / (height[main].mean() + 1e-9)),
+        "e_power": float((height[sounding] >= 0.8 * peak).mean()),
+        "e_bass": float((low * height)[main].mean()),
+        "e_highs": float((high / total)[main].mean()),
+        "mood": mood,
     }
+
+
+def main_sections(phrases: list, n_entries: int) -> list[tuple[float, float]]:
+    """[(start s, end s)] of the drops / choruses among rekordbox's phrases."""
+    end_of_track = n_entries / WAVEFORM_RATE
+    out = []
+    for i, p in enumerate(phrases):
+        if p.label in MAIN_SECTIONS:
+            end = phrases[i + 1].start_ms / 1000 if i + 1 < len(phrases) else end_of_track
+            out.append((p.start_ms / 1000, end))
+    return out
 
 
 def analyse_waveforms(paths: dict[str, str], log: Callable[[str], None] = print,
@@ -182,9 +229,12 @@ def analyse_waveforms(paths: dict[str, str], log: Callable[[str], None] = print,
     """Measure tracks from rekordbox's own analysis. paths = {track id: .EXT path}."""
     log(f"Energy: reading rekordbox's analysis of {len(paths)} tracks ...")
     results, failures = {}, 0
+    import cues
     for n, (tid, path) in enumerate(paths.items(), 1):
         try:
-            results[tid] = measure_waveform(read_waveform(path))
+            entries = read_waveform(path)
+            mood, phrases = cues.read_structure(path)
+            results[tid] = measure_waveform(entries, main_sections(phrases, len(entries)), mood)
         except (OSError, ValueError):
             failures += 1
         if progress:
@@ -198,27 +248,77 @@ def analyse_waveforms(paths: dict[str, str], log: Callable[[str], None] = print,
 # Scoring
 # --------------------------------------------------------------------------- #
 
+def _percentiles(values: list) -> np.ndarray:
+    """Each value's place among the others, 0 (lowest) to 1 (highest); ties share it.
+
+    Unlike averages and spreads, one extreme track can't skew everyone else.
+    Missing values (None) get the middle, 0.5.
+    """
+    known = [(v, i) for i, v in enumerate(values) if v is not None]
+    out = np.full(len(values), 0.5)
+    if len(known) < 2:
+        return out
+    known.sort()
+    n, j = len(known), 0
+    while j < n:
+        k = j
+        while k + 1 < n and known[k + 1][0] == known[j][0]:
+            k += 1
+        for _, i in known[j:k + 1]:
+            out[i] = ((j + k) / 2) / (n - 1)
+        j = k + 1
+    return out
+
+
+def effective_bpm(bpm: float, genre: str) -> float:
+    """BPM as felt: half-speed readings of Drum & Bass etc. are doubled."""
+    norm = " ".join(genre.casefold().replace("&", " and ").split())
+    if 0 < bpm < 100 and any(word in norm for word in DOUBLE_TIME):
+        return bpm * 2
+    return bpm
+
+
+def energy_scores(features: dict[str, dict], bpms: dict[str, float],
+                  genres: Optional[dict[str, str]] = None) -> dict[str, float]:
+    """One energy score per track (higher = more energetic), compared across all of them."""
+    ids = list(features)
+    genres = genres or {}
+    score = np.zeros(len(ids))
+    for name in FEATURES:
+        score += WEIGHTS[name] * _percentiles([features[i].get(name) for i in ids])
+    tempo = [effective_bpm(bpms.get(i, 0), genres.get(i, "")) for i in ids]
+    score += WEIGHTS["tempo"] * _percentiles([b if b > 0 else None for b in tempo])
+    # rekordbox's mood: 1 = high, 2 = mid, 3 = low
+    score += WEIGHTS["mood"] * np.array([{1: 1.0, 2: 0.5, 3: 0.0}.get(
+        int(features[i].get("mood") or 0), 0.5) for i in ids])
+    return dict(zip(ids, score.tolist()))
+
+
+def levels_from_scores(scores: dict[str, float]) -> dict[str, int]:
+    """1-5 by rank: the most energetic fifth gets 5, the calmest fifth 1.
+
+    The highest-scoring track is always 5 and the lowest 1. Tracks with the
+    same score (e.g. two copies of a song) get the same level.
+    """
+    ids = list(scores)
+    if not ids:
+        return {}
+    if len(ids) == 1:
+        return {ids[0]: 3}
+    place = _percentiles([round(scores[i], 9) for i in ids])
+    return {i: min(5, 1 + int(p * 5)) for i, p in zip(ids, place)}
+
+
 def _zscores(values: list[float]) -> np.ndarray:
     arr = np.asarray(values, dtype=float)
     std = arr.std()
     return np.zeros_like(arr) if std == 0 else (arr - arr.mean()) / std
 
 
-def levels_from_features(features: dict[str, dict], bpms: dict[str, float]) -> dict[str, int]:
+def levels_from_features(features: dict[str, dict], bpms: dict[str, float],
+                         genres: Optional[dict[str, str]] = None) -> dict[str, int]:
     """Turn raw features into 1-5 levels, ranked across all given tracks."""
-    ids = list(features)
-    if not ids:
-        return {}
-    score = np.zeros(len(ids))
-    for name in FEATURES:
-        score += WEIGHTS[name] * _zscores([features[i][name] for i in ids])
-    known_bpm = [bpms.get(i, 0) for i in ids]
-    if any(known_bpm):
-        fill = float(np.median([b for b in known_bpm if b > 0]))
-        score += WEIGHTS["bpm"] * _zscores([b if b > 0 else fill for b in known_bpm])
-
-    ranks = score.argsort().argsort()          # 0 = lowest score
-    return {i: int(1 + (r + 0.5) * 5 // len(ids)) for i, r in zip(ids, ranks)}
+    return levels_from_scores(energy_scores(features, bpms, genres))
 
 
 # --------------------------------------------------------------------------- #

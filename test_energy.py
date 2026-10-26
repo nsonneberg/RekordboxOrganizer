@@ -112,10 +112,56 @@ class EnergyTests(unittest.TestCase):
         self.assertNotIn("9", feats)
         self.assertEqual(len(feats), 3)
 
+    @staticmethod
+    def feats(value, **extra):
+        return {name: value for name in energy.FEATURES} | extra
+
     def test_levels_spread_across_library(self):
-        feats = {str(i): {"loudness": i, "flux": i, "brightness": i, "highs": i} for i in range(10)}
+        feats = {str(i): self.feats(i) for i in range(10)}
         levels = energy.levels_from_features(feats, {})
         self.assertEqual([levels[str(i)] for i in range(10)], [1, 1, 2, 2, 3, 3, 4, 4, 5, 5])
+
+    def test_highest_is_5_and_lowest_is_1_even_in_tiny_libraries(self):
+        for n in (2, 3, 4, 7):
+            levels = energy.levels_from_features({str(i): self.feats(i) for i in range(n)}, {})
+            self.assertEqual((levels["0"], levels[str(n - 1)]), (1, 5), n)
+        self.assertEqual(energy.levels_from_features({"a": self.feats(1)}, {}), {"a": 3})
+
+    def test_one_extreme_track_doesnt_skew_the_rest(self):
+        feats = {str(i): self.feats(i) for i in range(10)}
+        feats["9"]["e_punch"] = 1e6          # e.g. an odd demo track
+        levels = energy.levels_from_features(feats, {})
+        self.assertEqual([levels[str(i)] for i in range(10)], [1, 1, 2, 2, 3, 3, 4, 4, 5, 5])
+
+    def test_copies_of_a_song_share_a_level(self):
+        feats = {str(i): self.feats(i) for i in range(10)}
+        feats["copy"] = dict(feats["4"])
+        levels = energy.levels_from_features(feats, {str(i): 128 for i in range(10)} | {"copy": 128})
+        self.assertEqual(levels["copy"], levels["4"])
+
+    def test_half_speed_drum_and_bass_counts_double(self):
+        self.assertEqual(energy.effective_bpm(87, "Drum & Bass"), 174)
+        self.assertEqual(energy.effective_bpm(87, "Hip Hop"), 87)
+        self.assertEqual(energy.effective_bpm(174, "Drum & Bass"), 174)
+        feats = {"dnb": self.feats(5), "house": self.feats(5)}
+        scores = energy.energy_scores(feats, {"dnb": 87, "house": 128},
+                                      {"dnb": "Drum & Bass", "house": "House"})
+        self.assertGreater(scores["dnb"], scores["house"])
+
+    def test_energy_is_judged_in_the_drops(self):
+        # 60 s track: quiet everywhere except a loud, bass-heavy drop at 20-40 s.
+        def entry(height, low, high):
+            return (low << 13) | (3 << 10) | (high << 7) | (height << 2)
+        quiet, loud = entry(8, 2, 1), entry(28, 7, 4)
+        wave = np.array([loud if 20 * 150 <= i < 40 * 150 else quiet for i in range(60 * 150)],
+                        dtype=np.uint16)
+        with_drop = energy.measure_waveform(wave, [(20.0, 40.0)], mood=1)
+        self.assertEqual(with_drop["e_loud"], 28)
+        self.assertEqual(with_drop["mood"], 1)
+        wrong_spot = energy.measure_waveform(wave, [(0.0, 20.0)])
+        self.assertLess(wrong_spot["e_loud"], with_drop["e_loud"])
+        # Without phrase analysis the loudest stretch is used instead.
+        self.assertEqual(energy.measure_waveform(wave)["e_loud"], 28)
 
     def test_xml_run_writes_energy_ratings_and_playlists(self):
         tracks = "".join(

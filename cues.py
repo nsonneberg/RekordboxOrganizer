@@ -40,17 +40,22 @@ def read_phrases(ext_path: str) -> list[Phrase]:
     A run of phrases with the same label (e.g. Chorus, Chorus) counts as one
     section, starting where the run starts.
     """
+    return read_structure(ext_path)[1]
+
+
+def read_structure(ext_path: str) -> tuple[int, list[Phrase]]:
+    """(rekordbox's mood: 1 high, 2 mid, 3 low, 0 unknown; the sections, as read_phrases)."""
     from pyrekordbox import AnlzFile
 
     dat_path = os.path.splitext(ext_path)[0] + ".DAT"
     if not ext_path or not os.path.exists(ext_path) or not os.path.exists(dat_path):
-        return []
+        return 0, []
     ext = AnlzFile.parse_file(ext_path)
     if "PSSI" not in ext.tag_types:
-        return []
+        return 0, []
     dat = AnlzFile.parse_file(dat_path)
     if "PQTZ" not in dat.tag_types:
-        return []
+        return 0, []
     beats = [int(b.time) for b in dat.get_tag("PQTZ").content.entries]   # ms per beat
     pssi = ext.get_tag("PSSI").content
     names = LABELS.get(int(pssi.mood), LABELS[2])
@@ -63,7 +68,8 @@ def read_phrases(ext_path: str) -> list[Phrase]:
         if phrases and phrases[-1].label == label:
             continue
         phrases.append(Phrase(beats[entry.beat - 1], label))
-    return phrases
+    mood = int(pssi.mood)
+    return (mood if mood in LABELS else 0), phrases
 
 
 def choose_hot_cues(phrases: list[Phrase], used_pads: set[int],

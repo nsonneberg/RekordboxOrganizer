@@ -163,15 +163,34 @@ than empty pads, drops and build-ups win. Works straight from rekordbox only, no
 an XML export. Tracks need phrase analysis, which is on by default; otherwise turn on
 **Preferences → Analysis → Phrase** in rekordbox and re-analyse them.
 
-**Energy:** measures each track's loudness, rhythmic activity, brightness,
-hi-hat/percussion content and BPM. Working straight from rekordbox, it reads the colour
-waveform rekordbox already made when it analysed the track, so it's fast and works for
-every format. With an XML export, it listens to the audio files instead. Tracks are ranked against the rest
-of your library: 1 = your calmest 20%, 5 = your most energetic 20%. You get a
-"By Energy" playlist folder (1 - Chill, 2 - Warm-up, 3 - Groove, 4 - Driving,
-5 - Peak Time). You can also set each track's star rating to its energy level, and
-leave alone tracks you've already rated. Results are cached, so after the first run
-only new or changed tracks are analysed.
+**Energy:** judges each track by its drops and choruses (found with rekordbox's phrase
+analysis), not by intros and breakdowns. Without phrase analysis, the loudest stretches
+are used. It measures:
+
+- how loud the main sections are
+- how punchy the beat is
+- how much of the track runs at full power
+- bass weight and hi-hats
+- tempo (half-speed readings of Drum & Bass, e.g. 87 instead of 174 BPM, are doubled)
+- rekordbox's own mood rating
+
+Working straight from rekordbox, it reads the colour waveform rekordbox made when it
+analysed the track, so it's fast and works for every format. With an XML export, it
+listens to the audio files instead.
+
+Tracks are ranked against the rest of your library. One unusual track can't skew the
+others, and copies of the same song get the same level: 1 = your calmest 20%,
+5 = your most energetic 20%. You get a "By Energy" playlist folder (1 - Chill,
+2 - Warm-up, 3 - Groove, 4 - Driving, 5 - Peak Time).
+
+**Star ratings:** each track's stars can be set to its energy level, so your
+highest-energy songs get 5 stars and your lowest get 1. The full range is always used,
+even in a small library. Tick "Keep ratings I've already set" to leave songs you've
+rated yourself alone. Measurements are cached, so after the first run only new or
+changed tracks are analysed.
+
+The app only sees measurements. A track mastered quieter than the rest can come out
+lower than it feels. Rate it yourself and keep your ratings if so.
 
 **Extra playlists (optional, all off by default):** Genre · BPM range (step size you choose) · Key (Camelot, in wheel order) ·
 Artist · Record label · Release year · Star rating · Track color · Month added

@@ -734,11 +734,19 @@ def analyse_tracks(tracks: list[Track], log: Callable[[str], None],
 
 
 def apply_energy(tracks: list[Track], opt: Options, features: dict[str, dict],
-                 log: Callable[[str], None]) -> dict[str, int]:
-    """Set Track.energy from the measurements; return {track id: new star rating}."""
+                 log: Callable[[str], None],
+                 guesses: Optional[dict[str, str]] = None) -> dict[str, int]:
+    """Set Track.energy from the measurements; return {track id: new star rating}.
+
+    Star ratings follow the level: the most energetic songs get 5 stars and the
+    calmest 1.
+    """
     import energy
 
-    levels = energy.levels_from_features(features, {t.id: t.bpm for t in tracks})
+    guesses = guesses or {}
+    genre_of = {t.id: f"{t.genre} {guesses.get(t.id, '')}" for t in tracks}
+    scores = energy.energy_scores(features, {t.id: t.bpm for t in tracks}, genre_of)
+    levels = energy.levels_from_scores(scores)
     ratings: dict[str, int] = {}
     counts = [0] * 6
     for t in tracks:
@@ -750,6 +758,11 @@ def apply_energy(tracks: list[Track], opt: Options, features: dict[str, dict],
             ratings[t.id] = level
     log("Energy levels: " + ", ".join(f"{i}: {counts[i]}" for i in range(1, 6))
         + (f" ({counts[0]} not analysed)" if counts[0] else ""))
+    if scores:
+        names = {t.id: t.name or t.id for t in tracks}
+        top = max(scores, key=scores.get)
+        bottom = min(scores, key=scores.get)
+        log(f"  Most energetic: {names.get(top, top)}. Calmest: {names.get(bottom, bottom)}.")
     return ratings
 
 
@@ -776,13 +789,13 @@ def _organize(tracks: list[Track], opt: Options, log: Callable[[str], None],
         if want_energy and not opt.energy:
             log("Your playlist rules use energy, so the app will measure your music.")
         features = analyse_tracks(library, log, progress)
-    ratings = apply_energy(library, opt, features, log) if want_energy else {}
-    chosen = {t.id for t in tracks}
-    ratings = {i: stars for i, stars in ratings.items() if i in chosen}
     guesses: dict[str, str] = {}
     if want_guesses:
         import genres
         guesses = genres.guess_genres(library, features, log)
+    ratings = apply_energy(library, opt, features, log, guesses) if want_energy else {}
+    chosen = {t.id for t in tracks}
+    ratings = {i: stars for i, stars in ratings.items() if i in chosen}
 
     by_guess: set = set()
     plan = build_plan(tracks, opt, rules, guesses, by_guess)
