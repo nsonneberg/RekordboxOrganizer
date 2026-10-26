@@ -98,6 +98,14 @@ class Options:
     energy_ratings: bool = True  # ...and set the star rating to the energy level
     keep_ratings: bool = True    # ...except on tracks that already have a rating
     phrase_cues: bool = False    # hot cues where sections start (direct mode only)
+    # Set builder: one playlist in mixable order following an energy curve.
+    set_build: bool = False
+    set_name: str = "My Set"
+    set_start: int = 2
+    set_end: int = 5
+    set_length: int = 20
+    set_genres: str = ""
+    set_bpm: str = ""
     # Automatic playlists: all off unless asked for.
     genre: bool = False
     bpm: bool = False
@@ -135,6 +143,7 @@ class Changes:
     removed: list = field(default_factory=list)   # (playlist, track id)
     cues: list = field(default_factory=list)      # (track id, pad, label, ms)
     genres: list = field(default_factory=list)    # (track id, old genre, new genre)
+    sets: list = field(default_factory=list)      # (playlist, [track ids in order], replaced)
     names: dict = field(default_factory=dict)     # track id -> song name, for showing them
 
     def empty(self) -> bool:
@@ -277,6 +286,7 @@ def select_tracks(tracks: list[Track], opt: Options) -> list[Track]:
 
 
 LEFTOVERS_NAME = "Everything Else"
+SETS_FOLDER = "Sets"   # set builder playlists: rewritten in order on every run
 TOP_LEVEL = ""   # plan folder name meaning "directly inside the main folder"
 
 # Genre words that belong together. Typing any word in a group also matches the
@@ -505,7 +515,7 @@ class Evictor:
         if sync:
             for folder, lists in plan:
                 path = folder_path(folder)
-                if path:
+                if path and path[0] != SETS_FOLDER:
                     self.roots.add(_key(path[0]))
                     for name, ids in lists:
                         key = (tuple(_key(p) for p in path), _key(name))
@@ -663,7 +673,7 @@ def write_library(tree: ET.ElementTree, plan: Plan, folder_name: str, out_path: 
 
     evict: which songs to take out of existing playlists (see Evictor).
     Returns (playlists created, playlists added to, tracks added,
-    [(playlist name, track id) taken out]).
+    [(folder path, playlist name, track id) taken out]).
     """
     root = tree.getroot()
     if ratings:
@@ -716,7 +726,7 @@ def write_library(tree: ET.ElementTree, plan: Plan, folder_name: str, out_path: 
                 for t in el.findall("TRACK"):
                     if t.get("Key") in ids:
                         el.remove(t)
-                        removed.append((name, t.get("Key")))
+                        removed.append((path, name, t.get("Key")))
                         if changes is not None:
                             changes.removed.append((" / ".join(
                                 (organized.get("Name"),) + path + (name,)), t.get("Key")))
@@ -734,6 +744,21 @@ def write_library(tree: ET.ElementTree, plan: Plan, folder_name: str, out_path: 
         for title, ids in lists:
             where = " / ".join((organized.get("Name"),) + path + (title,))
             pl = child(sub, title, "1")
+            if path == (SETS_FOLDER,):
+                # A set is in play order: write it afresh rather than adding on.
+                if changes is not None:
+                    changes.sets.append((where, list(ids), pl is not None))
+                if pl is None:
+                    pl = ET.SubElement(sub, "NODE", Name=title, Type="1", KeyType="0")
+                    created += 1
+                else:
+                    for t in pl.findall("TRACK"):
+                        pl.remove(t)
+                    updated += 1
+                for track_id in ids:
+                    ET.SubElement(pl, "TRACK", Key=track_id)
+                pl.set("Entries", str(len(ids)))
+                continue
             if pl is None:
                 pl = ET.SubElement(sub, "NODE", Name=title, Type="1", KeyType="0", Entries="0")
                 created += 1
@@ -766,13 +791,15 @@ def describe_moves(removed: list, plan: Plan, tracks: list[Track],
     """Log the songs that were moved to a playlist they fit better."""
     if not removed:
         return
-    target = {i: name for folder, lists in plan if folder_path(folder) == ()
-              for name, ids in lists for i in ids}
+    target = {(tuple(_key(p) for p in folder_path(folder)), i): name
+              for folder, lists in plan for name, ids in lists for i in ids}
     names = {t.id: t.name or t.path or t.id for t in tracks}
     log(f"Moved {len(removed)} song{'s' if len(removed) != 1 else ''} to the playlist "
         f"{'they fit' if len(removed) != 1 else 'it fits'} better:")
-    for playlist, track_id in removed[:30]:
-        log(f"    {names.get(track_id, track_id)}: {playlist} -> {target.get(track_id, '?')}")
+    for path, playlist, track_id in removed[:30]:
+        new = target.get((tuple(_key(p) for p in path), track_id), "removed (no longer fits)")
+        where = f" ({' / '.join(path)})" if path else ""
+        log(f"    {names.get(track_id, track_id)}: {playlist} -> {new}{where}")
     if len(removed) > 30:
         log(f"    ... and {len(removed) - 30} more.")
 
@@ -846,6 +873,12 @@ def apply_energy(tracks: list[Track], opt: Options, features: dict[str, dict],
     return ratings
 
 
+def set_request(opt: Options):
+    import setbuilder
+    return setbuilder.SetRequest(opt.set_name.strip() or "My Set", opt.set_start, opt.set_end,
+                                 opt.set_length, opt.set_genres, opt.set_bpm)
+
+
 def _organize(tracks: list[Track], opt: Options, log: Callable[[str], None],
               progress: Optional[Callable[[int, int], None]]
               ) -> tuple[Plan, dict[str, int], list[Track]]:
@@ -861,13 +894,16 @@ def _organize(tracks: list[Track], opt: Options, log: Callable[[str], None],
             "organized (the rest of the library is only used for comparison).")
         if not tracks:
             raise ValueError(f"No songs were added {span}.")
-    want_energy = opt.energy or rules_need_energy(rules)
+    if opt.set_build:
+        import setbuilder
+        setbuilder.check(set_request(opt))
+    want_energy = opt.energy or rules_need_energy(rules) or opt.set_build
     want_guesses = opt.guess_genres and (opt.auto_genres or any(r.terms for r in rules))
 
     features: dict[str, dict] = {}
     if want_energy or want_guesses:
         if want_energy and not opt.energy:
-            log("Your playlist rules use energy, so the app will measure your music.")
+            log("Your playlist rules or set use energy, so the app will measure your music.")
         features = analyse_tracks(library, log, progress)
     guesses: dict[str, str] = {}
     if want_guesses:
@@ -879,6 +915,12 @@ def _organize(tracks: list[Track], opt: Options, log: Callable[[str], None],
 
     by_guess: set = set()
     plan = build_plan(tracks, opt, rules, guesses, by_guess)
+    if opt.set_build:
+        req = set_request(opt)
+        chain = setbuilder.build_set(library, req, guesses)   # from the whole library
+        log(setbuilder.describe(chain, req))
+        if chain:
+            plan.append((SETS_FOLDER, [(req.name, [t.id for t in chain])]))
     if not plan and not ratings and not opt.phrase_cues:
         raise ValueError("Nothing to do - tick at least one option.")
 
@@ -1041,6 +1083,12 @@ def summarize_changes(changes: Changes, names: Optional[dict[str, str]] = None) 
             shown = ", ".join(song(i) for i in ids[:5])
             more = f" and {len(ids) - 5} more" if len(ids) > 5 else ""
             lines.append(f"  {pl}: +{len(ids)}  ({shown}{more})")
+        lines.append("")
+
+    for where, ids, replaced in changes.sets:
+        lines.append(f"SET: {where} ({len(ids)} songs, "
+                     + ("replacing the old order)" if replaced else "new playlist)"))
+        lines.extend(f"  {n:>2}. {song(i)}" for n, i in enumerate(ids, 1))
         lines.append("")
 
     if changes.ratings:

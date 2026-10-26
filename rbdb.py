@@ -20,7 +20,8 @@ from uuid import uuid4
 # the pure-Python fallback is plenty fast for this.
 os.environ.setdefault("DISABLE_SQLALCHEMY_CEXT_RUNTIME", "1")
 
-from organizer import COLOUR_ORDER, Plan, Track, folder_path, same_name, to_camelot  # noqa: E402
+from organizer import (COLOUR_ORDER, SETS_FOLDER, Plan, Track, folder_path,  # noqa: E402
+                       same_name, to_camelot)
 
 KEEP_BACKUPS = 3
 PLAYLIST, FOLDER = 0, 1   # DjmdPlaylist.Attribute (smart playlists are 4)
@@ -221,7 +222,7 @@ def write_changes(db, contents: dict, plan: Plan, folder_name: str,
     commit: False leaves everything unsaved (the caller throws it away).
 
     Returns (playlists created, playlists added to, tracks added,
-    [(playlist name, track id) taken out]). evict: an organizer.Evictor saying
+    [(folder path, playlist name, track id) taken out]). evict: an organizer.Evictor saying
     which songs to take out of existing playlists.
 
     With merge, same-named folders and playlists (ignoring case) are reused and
@@ -274,7 +275,7 @@ def write_changes(db, contents: dict, plan: Plan, folder_name: str,
             for song in songs:
                 if str(song.ContentID) in ids:
                     db.delete(song)
-                    removed.append((pl.Name, str(song.ContentID)))
+                    removed.append((path, pl.Name, str(song.ContentID)))
                     if changes is not None:
                         changes.removed.append((" / ".join((top.Name,) + path + (pl.Name,)),
                                                 str(song.ContentID)))
@@ -317,6 +318,24 @@ def write_changes(db, contents: dict, plan: Plan, folder_name: str,
             for title, ids in lists:
                 where = " / ".join((top.Name,) + path + (title,))
                 pl = child(sub.ID, title, PLAYLIST)
+                if path == (SETS_FOLDER,):
+                    # A set is in play order: write it afresh rather than adding on.
+                    if changes is not None:
+                        changes.sets.append((where, list(ids), pl is not None))
+                    if pl is None:
+                        pl = db.create_playlist(title, parent=sub)
+                        created += 1
+                    else:
+                        for song in db.get_playlist_songs(PlaylistID=pl.ID).all():
+                            db.delete(song)
+                        db.flush()
+                        updated += 1
+                    now = datetime.datetime.now()
+                    for n, track_id in enumerate(ids, 1):
+                        db.add(models.DjmdSongPlaylist.create(
+                            ID=str(uuid4()), PlaylistID=str(pl.ID), ContentID=str(track_id),
+                            TrackNo=n, UUID=str(uuid4()), created_at=now, updated_at=now))
+                    continue
                 if pl is None:
                     pl = db.create_playlist(title, parent=sub)
                     have, last = set(), 0
