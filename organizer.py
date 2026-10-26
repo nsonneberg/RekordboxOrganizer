@@ -131,6 +131,11 @@ class Options:
     folder_name: str = "Organized"
 
 
+# Options whose rekordbox data format hasn't been checked against rekordbox's own
+# yet. They stay off (and hidden in the app) until it has.
+NOT_YET = ("cue_colours", "memory_cues", "energy_tags")
+
+
 # [(folder, [(playlist, [track ids])])]. folder is a name, TOP_LEVEL (straight into the
 # main folder), or a tuple of names for nested folders, e.g. ("Auto Genres", "House").
 Plan = list[tuple[object, list[tuple[str, list[str]]]]]
@@ -1060,6 +1065,7 @@ def run(opt: Options, xml_path: Optional[str] = None, log: Callable[[str], None]
     to see what a real run would do. Works while rekordbox is open.
     """
     folder_name = opt.folder_name.strip() or "Organized"
+    opt = dataclasses.replace(opt, **{name: False for name in NOT_YET})
     if changes is None:
         changes = Changes()
     if xml_path:

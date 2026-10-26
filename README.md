@@ -163,14 +163,6 @@ than empty pads, drops and build-ups win. Works straight from rekordbox only, no
 an XML export. Tracks need phrase analysis, which is on by default; otherwise turn on
 **Preferences → Analysis → Phrase** in rekordbox and re-analyse them.
 
-The hot cues can be **coloured by section**: drops and choruses red, build-ups orange,
-breakdowns and bridges blue, verses yellow, intro and outro green.
-
-**Mix-in and mix-out memory cues:** a memory cue where the intro ends (where you'd
-usually bring the next track in) and one where the outro starts (where you'd start
-mixing out). Intros shorter than 8 seconds get no mix-in cue, since the start of the
-track already does that job. Like hot cues, they're never doubled up on a re-run.
-
 **Energy:** judges each track by its drops and choruses (found with rekordbox's phrase
 analysis), not by intros and breakdowns. Without phrase analysis, the loudest stretches
 are used. It measures:
@@ -228,12 +220,6 @@ an energy close to where the set should be at that point. Sets go in the **Sets*
 folder and are rewritten in order each time you run, rather than added to. The log
 mentions any key clashes or big BPM jumps it couldn't avoid. Energy needs to be
 measured for this, which happens automatically.
-
-**Energy in My Tag:** tick "Tag it 'Energy 1-5' in My Tag" to put each song's level in
-rekordbox's My Tag. Untick the star rating option too if you want to keep stars for
-your own ratings. The tags go in a My Tag column named **Energy**. If you don't have
-one, rekordbox's unused "Untitled Column" is renamed, but only if no song uses it. Old
-levels are taken off when a song's energy changes. Works straight from rekordbox only.
 
 **Review genres:** on the Genres tab, **Review genres...** lists every song with no
 genre or a vague one ("Dance & EDM", "Electronic") next to the app's guess. Select

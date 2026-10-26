@@ -158,7 +158,10 @@ class App(ttk.Frame):
 
     def _check(self, parent, key, text, row, col=0, **kw):
         cb = ttk.Checkbutton(parent, text=text, variable=self.vars[key])
-        cb.grid(row=row, column=col, sticky="w", pady=2, **kw)
+        if key in organizer.NOT_YET:
+            self.vars[key].set(False)    # made but not shown until it's ready
+        else:
+            cb.grid(row=row, column=col, sticky="w", pady=2, **kw)
         return cb
 
     @staticmethod
@@ -345,9 +348,7 @@ class App(ttk.Frame):
                                           "if you untick the star rating)", 3, padx=(22, 0))
         self._hint(tab, "Judged in each track's drops and choruses with rekordbox's own "
                         "analysis. 5 = your most energetic 20%, 1 = your calmest. A 'By Energy' "
-                        "folder is made too. My Tags go in a column named 'Energy' (rekordbox's "
-                        "unused 'Untitled Column' is renamed if needed) and need 'Straight from "
-                        "rekordbox'.", 4)
+                        "folder is made too.", 4)
 
     def _tab_cues(self, tab):
         self.cues_cb = self._check(tab, "phrase_cues",
