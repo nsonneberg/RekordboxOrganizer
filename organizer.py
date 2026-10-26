@@ -92,6 +92,7 @@ class Options:
     date_from: str = ""          # only organize songs added on/after this date (YYYY-MM-DD)
     date_to: str = ""            # ...and on/before this one; "" = no limit
     merge_existing: bool = True  # add to same-named folders/playlists instead of replacing
+    move_mismatched: bool = True  # ...and move songs that now fit another playlist better
     auto_genres: bool = False    # auto genre detection: a folder per genre family
     energy: bool = False         # listen to the music and score energy 1-5
     energy_ratings: bool = True  # ...and set the star rating to the energy level
@@ -401,39 +402,81 @@ def rules_need_energy(rules: list[_Rule]) -> bool:
 
 
 def sort_into_custom(tracks: list[Track], rules: list[_Rule], leftovers: bool,
-                     guesses: Optional[dict[str, str]] = None):
+                     guesses: Optional[dict[str, str]] = None,
+                     by_guess: Optional[set] = None):
     """Put each track in the playlist it fits best; tracks that fit none are left alone.
 
-    guesses: {track id: guessed genre} for songs with no or a vague tag.
+    guesses: {track id: guessed genre} for songs with no or a vague tag. The
+    song's own tag comes first: a playlist naming it (e.g. 'EDM' for a song
+    tagged 'Dance & EDM') beats one that only matches the guess.
+    by_guess: if given, filled with the ids placed because of their guess.
     Returns [(name, [ids])]. Ties go to the playlist higher in the list.
     """
     guesses = guesses or {}
     lists: list[tuple[str, list[str]]] = [(r.name, []) for r in rules]
     rest: list[str] = []
     for t in sorted(tracks, key=lambda t: (t.bpm, t.artist.casefold(), t.name.casefold())):
-        genre = _norm_genre(guesses.get(t.id, t.genre))
-        best_i, best_score = None, None
+        tag = _norm_genre(t.genre)
+        guess = _norm_genre(guesses[t.id]) if t.id in guesses else ""
+        best_i, best_key = None, None
         for i, rule in enumerate(rules):
-            s = rule.score(t, genre)
-            if s is not None and (best_score is None or s > best_score):
-                best_i, best_score = i, s
+            if not rule.terms:
+                s = rule.score(t, tag)
+                key = None if s is None else (0, *s)
+            else:
+                s = rule.score(t, tag) if tag else None
+                key = (1, *s) if s is not None else None
+                if key is None and guess:
+                    s = rule.score(t, guess)
+                    key = None if s is None else (0, *s, "guess")
+            if key is not None and (best_key is None or key[:3] > best_key[:3]):
+                best_i, best_key = i, key
         if best_i is None:
             rest.append(t.id)
         else:
             lists[best_i][1].append(t.id)
+            if by_guess is not None and best_key[-1] == "guess":
+                by_guess.add(t.id)
     if leftovers and rest:
         lists.append((LEFTOVERS_NAME, rest))
     return lists
 
 
+def evictions(plan: Plan, rules: list[_Rule]) -> dict[str, set[str]]:
+    """{playlist name: track ids to take out of it} when re-running into existing playlists.
+
+    A song leaves one of the user's playlists (or 'Everything Else') only when it
+    now fits a *different* one of their playlists best; it's added there by the
+    plan. Songs that fit none stay where they are.
+    """
+    best: dict[str, str] = {}
+    names = {r.name for r in rules}
+    for folder, lists in plan:
+        if folder_path(folder) == ():
+            for name, ids in lists:
+                if name in names:
+                    for i in ids:
+                        best[i] = name
+    if not best:
+        return {}
+    out = {}
+    for name in [r.name for r in rules] + [LEFTOVERS_NAME]:
+        leaving = {i for i, target in best.items() if not same_name(target, name)}
+        if leaving:
+            out[name] = leaving
+    return out
+
+
 def build_plan(tracks: list[Track], opt: Options, rules: Optional[list[_Rule]] = None,
-               guesses: Optional[dict[str, str]] = None) -> Plan:
+               guesses: Optional[dict[str, str]] = None,
+               by_guess: Optional[set] = None) -> Plan:
     plan: Plan = []
 
     if rules is None:
         rules = compile_custom(opt)
     if rules:
-        plan.append((TOP_LEVEL, sort_into_custom(tracks, rules, opt.custom_leftovers, guesses)))
+        plan.append((TOP_LEVEL, sort_into_custom(tracks, rules, opt.custom_leftovers, guesses,
+                                                 by_guess)))
 
     if opt.auto_genres:
         import genres
@@ -553,8 +596,15 @@ def same_name(a: Optional[str], b: str) -> bool:
 
 def write_library(tree: ET.ElementTree, plan: Plan, folder_name: str, out_path: str,
                   ratings: Optional[dict[str, int]] = None, merge: bool = True,
-                  log: Callable[[str], None] = print) -> tuple[int, int, int]:
-    """Write the plan into the XML. Returns (playlists created, playlists added to, tracks added)."""
+                  log: Callable[[str], None] = print,
+                  evict: Optional[dict[str, set[str]]] = None) -> tuple[int, int, int, list]:
+    """Write the plan into the XML.
+
+    evict: {playlist name: track ids} to take out of existing playlists directly
+    in the main folder (see evictions()).
+    Returns (playlists created, playlists added to, tracks added,
+    [(playlist name, track id) taken out]).
+    """
     root = tree.getroot()
     if ratings:
         for el in root.iterfind("COLLECTION/TRACK"):
@@ -593,6 +643,17 @@ def write_library(tree: ET.ElementTree, plan: Plan, folder_name: str, out_path: 
             folders[path] = existing if existing is not None else _folder(parent, path[-1])
         return folders[path]
 
+    removed = []
+    for name, ids in (evict or {}).items():
+        pl = child(organized, name, "1")
+        if pl is None:
+            continue
+        for el in pl.findall("TRACK"):
+            if el.get("Key") in ids:
+                pl.remove(el)
+                removed.append((pl.get("Name"), el.get("Key")))
+        pl.set("Entries", str(len(pl.findall("TRACK"))))
+
     created = updated = added = 0
     for folder_title, lists in plan:
         sub = folder_for(folder_path(folder_title))
@@ -617,10 +678,26 @@ def write_library(tree: ET.ElementTree, plan: Plan, folder_name: str, out_path: 
     _set_count(top)
 
     tree.write(out_path, encoding="UTF-8", xml_declaration=True)
-    return created, updated, added
+    return created, updated, added, removed
 
 
-def describe_changes(created: int, updated: int, added: int) -> str:
+def describe_moves(removed: list, plan: Plan, tracks: list[Track],
+                   log: Callable[[str], None]) -> None:
+    """Log the songs that were moved to a playlist they fit better."""
+    if not removed:
+        return
+    target = {i: name for folder, lists in plan if folder_path(folder) == ()
+              for name, ids in lists for i in ids}
+    names = {t.id: t.name or t.path or t.id for t in tracks}
+    log(f"Moved {len(removed)} song{'s' if len(removed) != 1 else ''} to the playlist "
+        f"{'they fit' if len(removed) != 1 else 'it fits'} better:")
+    for playlist, track_id in removed[:30]:
+        log(f"    {names.get(track_id, track_id)}: {playlist} -> {target.get(track_id, '?')}")
+    if len(removed) > 30:
+        log(f"    ... and {len(removed) - 30} more.")
+
+
+def describe_changes(created: int, updated: int, added: int, removed: Optional[list] = None) -> str:
     parts = [f"{created} new playlist{'s' if created != 1 else ''}"]
     if updated:
         parts.append(f"{updated} existing playlist{'s' if updated != 1 else ''} added to")
@@ -707,7 +784,8 @@ def _organize(tracks: list[Track], opt: Options, log: Callable[[str], None],
         import genres
         guesses = genres.guess_genres(library, features, log)
 
-    plan = build_plan(tracks, opt, rules, guesses)
+    by_guess: set = set()
+    plan = build_plan(tracks, opt, rules, guesses, by_guess)
     if not plan and not ratings and not opt.phrase_cues:
         raise ValueError("Nothing to do - tick at least one option.")
 
@@ -717,7 +795,7 @@ def _organize(tracks: list[Track], opt: Options, log: Callable[[str], None],
         if path == ():
             placed = sum(len(ids) for name, ids in lists if name != LEFTOVERS_NAME)
             used = sum(1 for name, ids in lists if name != LEFTOVERS_NAME
-                       for i in ids if i in guesses)
+                       for i in ids if i in by_guess)
             log(f"Sorted {placed} of {len(tracks)} tracks into your playlists"
                 + (f" ({used} by guessed genre):" if used else ":"))
             for name, ids in lists:
@@ -735,6 +813,12 @@ def _organize(tracks: list[Track], opt: Options, log: Callable[[str], None],
         else:
             log(f"  {path[0]}: {len(lists)} playlist{'s' if len(lists) != 1 else ''}")
     return plan, ratings, tracks
+
+
+def _evictions(plan: Plan, opt: Options) -> dict[str, set[str]]:
+    if not (opt.merge_existing and opt.move_mismatched and opt.custom_enabled):
+        return {}
+    return evictions(plan, compile_custom(opt))
 
 
 def run(opt: Options, xml_path: Optional[str] = None, log: Callable[[str], None] = print,
@@ -755,10 +839,11 @@ def run(opt: Options, xml_path: Optional[str] = None, log: Callable[[str], None]
             log("Hot cues need rekordbox's phrase analysis, so they're only added when "
                 "working straight from rekordbox. Skipping them.")
             opt = dataclasses.replace(opt, phrase_cues=False)
-        plan, ratings, _ = _organize(tracks, opt, log, progress)
+        plan, ratings, chosen = _organize(tracks, opt, log, progress)
         out_path = default_output_path(xml_path)
         changes = write_library(tree, plan, folder_name, out_path, ratings,
-                                opt.merge_existing, log)
+                                opt.merge_existing, log, _evictions(plan, opt))
+        describe_moves(changes[3], plan, tracks, log)
         log(describe_changes(*changes))
         log(f"Saved: {out_path}")
         return out_path
@@ -783,7 +868,8 @@ def run(opt: Options, xml_path: Optional[str] = None, log: Callable[[str], None]
         log(f"Backed up your library to {os.path.basename(rbdb.backup(db_path))}")
         rbdb.add_hot_cues(db, contents, hot_cues, log)     # saved with everything below
         changes = rbdb.write_changes(db, contents, plan, folder_name, ratings, log,
-                                     opt.merge_existing)
+                                     opt.merge_existing, _evictions(plan, opt))
+        describe_moves(changes[3], plan, tracks, log)
         if plan:
             log(describe_changes(*changes))
         return db_path

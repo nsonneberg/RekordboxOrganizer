@@ -120,8 +120,12 @@ def backup(db_path: str) -> str:
 
 def write_changes(db, contents: dict, plan: Plan, folder_name: str,
                   ratings: dict[str, int], log: Callable[[str], None] = print,
-                  merge: bool = True) -> tuple[int, int, int]:
-    """Apply ratings and the plan. Returns (playlists created, playlists added to, tracks added).
+                  merge: bool = True, evict: Optional[dict] = None) -> tuple[int, int, int, list]:
+    """Apply ratings and the plan.
+
+    Returns (playlists created, playlists added to, tracks added,
+    [(playlist name, track id) taken out]). evict: {playlist name: track ids}
+    to take out of existing playlists directly in the main folder.
 
     With merge, same-named folders and playlists (ignoring case) are reused and
     new tracks are appended; nothing already in them is removed. Smart playlists
@@ -139,6 +143,7 @@ def write_changes(db, contents: dict, plan: Plan, folder_name: str,
         log(f"Updated star ratings on {changed} tracks.")
 
     created = updated = added = 0
+    removed: list = []
     if plan:
         def child(parent_id: str, name: str, attribute: int):
             matches = [p for p in db.get_playlist(ParentID=parent_id).all()
@@ -157,6 +162,32 @@ def write_changes(db, contents: dict, plan: Plan, folder_name: str,
         else:
             top = db.create_playlist_folder(folder_name)
         folders = {(): top}
+
+        for name, ids in (evict or {}).items():
+            pl = child(top.ID, name, PLAYLIST)
+            if pl is None:
+                continue
+            # Like db.remove_from_playlist(), but without its commit per song,
+            # so the whole run is still saved at once.
+            songs = sorted(db.get_playlist_songs(PlaylistID=pl.ID).all(),
+                           key=lambda s: s.TrackNo or 0)
+            keep, now = [], datetime.datetime.now()
+            for song in songs:
+                if str(song.ContentID) in ids:
+                    db.delete(song)
+                    removed.append((pl.Name, str(song.ContentID)))
+                else:
+                    keep.append(song)
+            if len(keep) < len(songs):
+                renumbered = []
+                with db.registry.disabled():
+                    for n, song in enumerate(keep, 1):
+                        if song.TrackNo != n:
+                            song.TrackNo, song.updated_at = n, now
+                            renumbered.append(song)
+                if renumbered:
+                    db.registry.on_move(renumbered)
+                db.flush()
 
         def folder_for(path: tuple):
             if path not in folders:
@@ -193,7 +224,7 @@ def write_changes(db, contents: dict, plan: Plan, folder_name: str,
                     added += 1
 
     db.commit()
-    return created, updated, added
+    return created, updated, added, removed
 
 
 # Hot cue pads A-H as stored in DjmdCue.Kind (0 is a memory cue; there's no 4).

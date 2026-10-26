@@ -118,6 +118,7 @@ class App(ttk.Frame):
         defaults = organizer.Options(custom_enabled=True)
         self.vars = {name: tk.BooleanVar(value=getattr(defaults, name)) for name in (
             "custom_enabled", "custom_leftovers", "guess_genres", "auto_genres", "merge_existing",
+            "move_mismatched",
             "energy", "energy_ratings", "keep_ratings", "phrase_cues",
             "genre", "bpm", "key", "artist", "label", "year", "rating", "colour",
             "date_added", "duplicates", "missing_files", "missing_info", "never_played")}
@@ -134,7 +135,7 @@ class App(ttk.Frame):
         master.columnconfigure(0, weight=1)
         master.rowconfigure(0, weight=1)
         for var in (self.source, self.vars["energy"], self.vars["energy_ratings"],
-                    self.vars["custom_enabled"], self.date_mode):
+                    self.vars["custom_enabled"], self.date_mode, self.vars["merge_existing"]):
             var.trace_add("write", lambda *_: self._sync_states())
         self.playlist_count.trace_add("write", lambda *_: self._resize_rows())
         self._sync_states()
@@ -296,6 +297,9 @@ class App(ttk.Frame):
         self.leftovers_cb = check(tab, "custom_leftovers",
                                   f"Also make an '{organizer.LEFTOVERS_NAME}' playlist for songs "
                                   "that fit nowhere", 2, 0)
+        self.move_cb = check(tab, "move_mismatched",
+                             "When adding to existing playlists, move songs to the playlist "
+                             "they now fit best", 3, 0)
         ttk.Label(tab, foreground="gray", wraplength=760, justify="left",
                   text="A song is added only if it matches every rule you fill in; songs that "
                        "don't fit are left alone. Genre is relaxed: 'house' also catches "
@@ -303,7 +307,7 @@ class App(ttk.Frame):
                        "untagged songs that sound like house. If a song fits several "
                        "playlists it goes to the best genre match. "
                        "BPM: 120-126, 128+ or 174. Energy (1-5): 4-5, 3+ or 2."
-                  ).grid(row=3, column=0, sticky="w", pady=(4, 0))
+                  ).grid(row=4, column=0, sticky="w", pady=(4, 0))
         return tab
 
     def _build_auto_tab(self, tabs, check) -> ttk.Frame:
@@ -380,6 +384,7 @@ class App(ttk.Frame):
         custom = "normal" if self.vars["custom_enabled"].get() else "disabled"
         self.count_spin.configure(state=custom)
         self.leftovers_cb.configure(state=custom)
+        self.move_cb.configure(state=custom if self.vars["merge_existing"].get() else "disabled")
         for row in self.rows:
             for w in row.widgets[1:]:
                 w.configure(state=custom)

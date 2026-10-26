@@ -98,5 +98,84 @@ class XmlMergeTests(unittest.TestCase):
             organizer.run(techno(date_from="2030-01-01"), self.path, **QUIET)
 
 
+class TagFirstTests(unittest.TestCase):
+    def test_own_tag_beats_a_guess(self):
+        def track(i, genre):
+            return organizer.Track(id=i, name=i, artist="", genre=genre, label="", bpm=128,
+                                   key="", year=0, rating=0, colour="", date_added="",
+                                   play_count=0, path="")
+        tracks = [track("edm", "Dance & EDM"), track("plain", ""), track("deep", "Deep House")]
+        guesses = {"edm": "House", "plain": "House"}      # vague / missing tags were guessed
+        rules = organizer.compile_custom(organizer.Options(custom_enabled=True, custom=[
+            organizer.CustomPlaylist("House", "house"), organizer.CustomPlaylist("EDM", "edm")]))
+        by_guess = set()
+        lists = dict(organizer.sort_into_custom(tracks, rules, False, guesses, by_guess))
+        self.assertEqual(lists, {"House": ["deep", "plain"], "EDM": ["edm"]})
+        self.assertEqual(by_guess, {"plain"})
+
+        # Without an EDM playlist the vague tag isn't used, so the guess decides.
+        lists = dict(organizer.sort_into_custom(tracks, rules[:1], False, guesses))
+        self.assertEqual(sorted(lists["House"]), ["deep", "edm", "plain"])
+
+
+class MoveTests(unittest.TestCase):
+    """Re-running moves songs to the playlist they now fit best."""
+
+    def setUp(self):
+        fd, self.path = tempfile.mkstemp(suffix=".xml")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(SAMPLE)
+        self.out = organizer.default_output_path(self.path)
+        self.addCleanup(lambda: [os.remove(p) for p in (self.path, self.out) if os.path.exists(p)])
+        # First run: one broad playlist by BPM only -> tracks 1, 2 (tech house) and 4 (techno).
+        organizer.run(organizer.Options(custom_enabled=True, guess_genres=False, custom=[
+            organizer.CustomPlaylist("House", "", "120-145")]), self.path, **QUIET)
+        # By hand, the user also put track 3 (no genre, no BPM) in House.
+        tree = ET.parse(self.out)
+        house = tree.getroot().find("PLAYLISTS/NODE/NODE[@Name='Organized']/NODE[@Name='House']")
+        ET.SubElement(house, "TRACK", Key="3")
+        tree.write(self.out, encoding="UTF-8", xml_declaration=True)
+
+    def rerun(self, **kw):
+        logs = []
+        opt = organizer.Options(custom_enabled=True, guess_genres=False, custom=[
+            organizer.CustomPlaylist("House", "house", "120-145"),
+            organizer.CustomPlaylist("Techno", "techno")], **kw)
+        second = organizer.run(opt, self.out, log=logs.append)
+        self.addCleanup(os.remove, second)
+        folder = ET.parse(second).getroot().find("PLAYLISTS/NODE/NODE[@Name='Organized']")
+        keys = {pl.get("Name"): [t.get("Key") for t in pl.findall("TRACK")]
+                for pl in folder.findall("NODE")}
+        return keys, logs
+
+    def test_moves_song_that_fits_a_new_playlist_better(self):
+        keys, logs = self.rerun()
+        self.assertEqual(keys["Techno"], ["4"])
+        # 4 left House; 3 fits nothing, so it stays where the user put it.
+        self.assertEqual(keys["House"], ["1", "2", "3"])
+        self.assertTrue(any("Moved 1 song" in m for m in logs))
+        self.assertTrue(any("Song D: House -> Techno" in m for m in logs))
+
+    def test_moving_can_be_turned_off(self):
+        keys, _ = self.rerun(move_mismatched=False)
+        self.assertEqual(keys["House"], ["1", "2", "4", "3"])
+        self.assertEqual(keys["Techno"], ["4"])
+
+    def test_only_songs_in_the_chosen_dates_move(self):
+        keys, _ = self.rerun(date_from="2024-01-01")   # track 4 was added 2023-01-01
+        self.assertIn("4", keys["House"])
+
+    def test_leaves_everything_else_when_it_fits_somewhere(self):
+        tree = ET.parse(self.out)
+        folder = tree.getroot().find("PLAYLISTS/NODE/NODE[@Name='Organized']")
+        rest = ET.SubElement(folder, "NODE", Name=organizer.LEFTOVERS_NAME, Type="1",
+                             KeyType="0", Entries="2")
+        for key in ("3", "4"):
+            ET.SubElement(rest, "TRACK", Key=key)
+        tree.write(self.out, encoding="UTF-8", xml_declaration=True)
+        keys, _ = self.rerun(custom_leftovers=True)
+        self.assertEqual(keys[organizer.LEFTOVERS_NAME], ["3"])
+
+
 if __name__ == "__main__":
     unittest.main()

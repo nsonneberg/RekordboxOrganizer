@@ -123,7 +123,9 @@ give it rules:
 **Genre guessing:** rekordbox's analysis doesn't include genre. It measures BPM, key and
 a colour waveform (loudness plus bass, mid and treble). For songs with no genre tag, or a
 vague one like "Electronic" or "Dance & EDM", the app estimates the genre from those
-measurements:
+measurements. A song's own tag still comes first: if one of your playlists names it
+(say an "EDM" playlist for songs tagged "Dance & EDM"), the song goes there rather
+than where its guess points. The estimate works like this:
 
 1. **Learned from your library.** Songs with a clear genre tag are used as examples.
    Each untagged song gets the genre of the tagged songs it sounds most like (BPM,
@@ -178,9 +180,17 @@ Artist · Record label · Release year · Star rating · Track color · Month ad
 
 Everything goes into one playlist folder (named "Organized" by default). If you run
 the app again, it **adds to** folders and playlists that already have the same name
-(ignoring capitals): new songs go at the end, songs already there aren't added twice,
-and nothing is removed. Untick "Add to existing folders / playlists" to replace the
-folder instead.
+(ignoring capitals): new songs go at the end, and songs already there aren't added
+twice. Untick "Add to existing folders / playlists" to replace the folder instead.
+
+**Songs move when they fit better:** when you re-run, songs already in your playlists
+are checked again. If a song now fits a *different* one of your playlists best (for
+example, you added an "EDM" playlist and it's tagged EDM), it's moved there: taken out
+of the old playlist and added to the new one. The log lists every move. Songs that
+still fit, or that fit none of your playlists (including ones you put somewhere by
+hand), stay where they are. Only your own playlists in the main folder are affected;
+a playlist you've removed from your list is left alone. Untick "move songs to the
+playlist they now fit best" in *My playlists* to turn this off.
 
 **Only new songs:** under "Songs to organize" pick *All*, *Added since last run* (the
 app remembers the date of each successful run), or *Added from … to …* (either date
