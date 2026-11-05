@@ -120,23 +120,105 @@ give it rules:
 - Your playlists go straight into the main folder (named "Organized" by default), and
   your setup is saved between runs.
 
-**Genre guessing:** rekordbox's analysis doesn't include genre. It measures BPM, key and
-a colour waveform (loudness plus bass, mid and treble). For songs with no genre tag, or a
-vague one like "Electronic" or "Dance & EDM", the app estimates the genre from those
-measurements. A song's own tag still comes first: if one of your playlists names it
-(say an "EDM" playlist for songs tagged "Dance & EDM"), the song goes there rather
-than where its guess points. The estimate works like this:
+**Genre guessing:** rekordbox's analysis doesn't include genre. For songs with no genre
+tag, or a vague one like "Electronic" or "Dance & EDM", the app estimates the genre. A
+song's own tag still comes first: if one of your playlists names it (say an "EDM"
+playlist for songs tagged "Dance & EDM"), the song goes there rather than where its
+guess points. The estimate weighs these kinds of evidence:
 
-1. **Learned from your library.** Songs with a clear genre tag are used as examples.
-   Each untagged song gets the genre of the tagged songs it sounds most like (BPM,
-   bass, brightness, punch, loudness). This needs at least 6 tagged songs across 2 or
-   more genres. The more you tag, the better it gets.
-2. **BPM and sound rules** otherwise, for example 160–185 BPM → Drum & Bass and
-   118–135 → House. In the 136–155 range it only names Dubstep, Techno or Trance on a
-   clear signal; otherwise it says EDM.
+1. **A tagged copy.** Another copy of the same recording (same artist, title and length)
+   already has a genre. Copies are matched by name, which can be wrong, so this is only
+   ever a suggestion for you to approve.
+2. **An audio genre model** (optional, on the Genres tab). The app listens to up to
+   four 10-second excerpts of each song: rekordbox's drops and choruses first, then
+   points 30%, 50% and 70% of the way through, never just the intro. Pick one model:
+   - **Discogs-EffNet** by the [MTG](https://essentia.upf.edu/models.html), trained on
+     Discogs releases. It knows 400 Discogs styles, including Tech House, Deep House,
+     Progressive House, Techno, Minimal, Psy-Trance, Bassline and UK Garage. 18 MB.
+     **Licence: CC BY-NC-SA 4.0, free for non-commercial use only** (the MTG sells a
+     commercial licence). It is the more accurate of the two for electronic music.
+   - **[YAMNet](https://github.com/tensorflow/models/tree/master/research/audioset/yamnet)**
+     by Google, Apache-2.0 (any use). It knows about 50 broad styles (House, Techno,
+     Drum and bass…), not subgenres. 16 MB.
 
-Your own playlists use these guesses, so a "Dance & EDM" track at 125 BPM can land in
-your House playlist. Turn guessing off to match on tags only.
+   Either model is downloaded once from a fixed version, checked against its SHA-256,
+   and then runs on your computer (CPU only, no internet needed, about 0.3 s per song).
+   Results are saved per model, so only new or changed songs are listened to, and
+   switching models never mixes their results.
+3. **Your tagged songs.** A small classifier is trained on your own tagged songs, using
+   what the model hears (or else rekordbox's waveform). This needs at least 3 tagged
+   recordings in each of 2 or more genres. Copies of a song count once. It can only
+   answer with genres you've tagged, so for anything else it defers to the model.
+   Subgenres (Tech House, Liquid…) are named only when the model's styles or your
+   nearest tagged songs clearly agree.
+4. **Release info** (optional, off by default, needs internet). The app looks the song
+   up on [MusicBrainz](https://musicbrainz.org), and on [Discogs](https://www.discogs.com)
+   only if you also tick **Also Discogs**. The first time you switch lookups on, the app
+   asks you, and says what is sent: each song's artist, title and length (for songs being
+   guessed and your tagged ones), nothing else. No audio, file names or other library
+   data leave your computer, and the audio analysis always runs offline. A match must have the same title, an
+   overlapping artist and the same version: "Song (X Remix)" only matches X's remix,
+   never the original. Genres come from the recording itself, else its single or EP at
+   lower weight, never from the artist or a various-artists compilation. If two equally
+   good matches disagree, neither is used. A song that isn't found counts as no
+   evidence, never as evidence against a genre. MusicBrainz answers are cached (matches
+   for 180 days, "not found" for 30); Discogs answers are kept for 6 hours at most and
+   never used to train the app. Requests are paced within each site's limits (MusicBrainz
+   about one a second; Discogs 25 a minute, 60 with a token), and if the internet is down
+   the app gives up after 3 failures and carries on without it. A Discogs
+   [personal token](https://www.discogs.com/settings/developers) is optional; it's kept in
+   Windows Credential Manager or the macOS Keychain, never in the settings file (a token
+   saved there by an earlier version is moved on first start). Genres from MusicBrainz
+   are CC BY-NC-SA 3.0 and the review window credits them; Discogs data is shown as
+   "Data provided by Discogs" (this app isn't affiliated with or endorsed by Discogs).
+5. **Tempo and the vague tag**, as supporting evidence only. A BPM read at half or double
+   speed (87 for 174 Drum & Bass) counts as a match. Tempo can make a genre less likely,
+   but **BPM alone never decides a genre.**
+
+**How it combines them:** the sources' answers are pooled (multiplied, in log space) with
+a weight for each source, and for a genre with at least 10 tagged songs, a per-genre
+weight too. The weights are fitted on your own tagged songs, using each source's answers
+for songs it hadn't learnt from (each song hidden in turn, with its other versions), so
+a source that agrees with the others because it's a copy of them, or that's often
+wrong, ends up counting less. A source with nothing to say (no match found, a genre it
+doesn't know) is left out rather than counted against anything. How often you've tagged
+each genre is used while fitting but doesn't vote on new songs: the songs being guessed
+are the ones you *didn't* tag, so "most of my tagged songs are House" isn't evidence that
+an untagged one is. The result is the combining model's confidence: a probability it
+fitted on your tagged songs, not a measured hit rate. On the author's library it was
+often under-confident (guesses at 70-90% were nearly always right) and over-confident
+below 50%, and a guess can be wrong even near 100%, for example when every source hears
+the same thing (the review window shows ">99%", never 100%). Separately, the app works out
+how confident a guess must be to count: the lowest level at which, on songs held out
+from fitting, the estimated error was at most 1 in 10 (with at least 8 such songs). That
+is an operating point, not a guarantee. On top of that, each genre must prove itself: a
+genre is only tagged automatically when its own held-out guesses make a low error rate
+likely, meaning the 95% upper bound on their error rate is at most 10%. With no mistakes
+that takes 29 held-out guesses of that genre; with one mistake, 46. Until then its clear
+guesses are **suggestions**: shown in the review window and in a "(suggested)" playlist
+inside Needs Review, for you to approve, never applied by themselves. Unclear guesses, or
+ones where the sources disagree, go to **Needs Review**. With fewer than 10 tagged songs
+nothing can be measured, so every guess is at most a suggestion. The review window says
+how often held-out guesses like each one were right. Even the 95% bound only describes
+songs like the ones you've tagged, judged against your own (possibly inconsistent) tags.
+A subgenre is assigned only once subgenre guesses have met the same bar; otherwise it's
+shown as a suggestion. Nothing is written to a song's genre tag until you save it in
+Review genres, and songs that already have a specific genre are never listed there. Genre names are
+normalised through a taxonomy (genre family → subgenre, with synonyms such as "UKG" →
+UK Garage and "Psychedelic Trance" → Psytrance). To add your own subgenres or synonyms,
+put a `taxonomy.json` next to the app's settings with the same shape as `DEFAULT` in
+`taxonomy.py`; it is merged on top.
+
+The app only names a genre when the evidence clearly points one way. Otherwise the song
+is marked **uncertain** and goes to a **Needs Review** folder. That includes songs where
+two reliable sources disagree (say the model hears House but the release is listed as
+Techno). Without a model, and with few tagged songs, most songs will be uncertain; that's
+deliberate. The confidences in the review window are the model's estimates, fitted on
+your own tagged songs, not guarantees: if your tags are inconsistent, so are they. Selecting a song shows each
+source's answer, how much it counted, any suggested subgenre and the release it matched.
+
+Your own playlists use only guesses that passed every check above (never suggestions), so a "Dance & EDM" track that clearly sounds
+like house can land in your House playlist. Turn guessing off to match on tags only.
 
 **Auto genre detection:** makes an **Auto Genres** folder with a folder for every genre
 family found in your library (House, Techno, Drum & Bass, Hip Hop…). Tags that fit no
@@ -149,9 +231,10 @@ Organized
    │  ├─ All House
    │  ├─ House
    │  ├─ Progressive House
-   │  └─ House (detected)      ← guessed songs, kept apart so you can check them
+   │  └─ House (detected)      ← confident guesses, kept apart so you can check them
    ├─ Drum & Bass
-   └─ Unknown Genre            ← no tag and no analysis to guess from
+   ├─ Needs Review             ← untagged songs the app isn't sure about
+   └─ Unknown Genre            ← no tag and nothing to guess from
 ```
 
 **Hot cues at phrase changes:** puts hot cues where each section of a track starts
@@ -175,8 +258,7 @@ are used. It measures:
 - rekordbox's own mood rating
 
 Working straight from rekordbox, it reads the colour waveform rekordbox made when it
-analysed the track, so it's fast and works for every format. With an XML export, it
-listens to the audio files instead.
+analysed the track. With an XML export, it listens to the audio files instead.
 
 Tracks are ranked against the rest of your library. One unusual track can't skew the
 others, and copies of the same song get the same level: 1 = your calmest 20%,
@@ -191,6 +273,55 @@ changed tracks are analysed.
 
 The app only sees measurements. A track mastered quieter than the rest can come out
 lower than it feels. Rate it yourself and keep your ratings if so.
+
+**Experimental energy algorithm (off by default):** a newer algorithm that scores each
+track on a fixed 0-100 scale from the decoded audio (rhythm, low-end hits, beat
+strength, density), so levels don't change as the library grows. Tick "Use the
+experimental algorithm" to try it. Against one listener's own ratings of 72 tracks it
+did much worse than the default: its ranking was no better than chance and it put
+almost every track at level 3 or 4. Songs it can't judge are left unrated.
+
+**M3 energy model (opt-in, off by default):** a model calibrated to one listener's
+ratings of one library. The classic algorithm stays the default. Tick "Use M3 instead"
+on the Energy tab to try it; it can't be combined with the experimental algorithm.
+
+- **Fixed levels:** a track's level comes from that track's own measurements, so it
+  doesn't change as your library grows, and levels needn't be spread evenly from 1 to 5.
+- **Straight from rekordbox only:** it needs rekordbox's analysis as well as the decoded
+  audio. With an XML export it's switched off and the run says so, using the classic
+  algorithm (or the experimental one, if ticked). Your choice comes back when you switch
+  back to rekordbox.
+- **Skipped songs:** a song with no analysis, audio that can't be decoded, no BPM or a
+  measurement that couldn't be made gets no level and keeps its rating, and the log says
+  why. No other algorithm stands in for it.
+
+It was tested once, on songs that shared no artist or recording with the songs it was
+built from, against criteria set in advance. The same listener rated them by ear from a
+sheet that showed no model's levels. Lower error is better, and the brackets are a 95% range:
+
+| 76 songs (65 artist groups)    | M3    | Classic | Tempo only |
+|--------------------------------|-------|---------|------------|
+| Average error, in levels       | 0.474 | 0.855   | 0.855      |
+| Exact level                    | 55%   | 39%     | 34%        |
+| Within one level               | 97%   | 80%     | 83%        |
+| Rank agreement (Spearman)      | 0.88  | 0.71    | 0.78       |
+
+M3's average error was 0.382 lower than the classic algorithm's [0.192 to 0.575 lower],
+and all the set criteria passed. What that doesn't show:
+
+- **It may not suit your ears.** It describes one listener and one library, and that
+  listener's ratings also trained it. How it does for anyone else hasn't been tested.
+- **It isn't shown to be better on calm songs.** On songs rated 1-2 it was not
+  meaningfully worse than the classic algorithm, but the result doesn't show it's better.
+- **It has known weak spots.** It often gave 1 to songs rated 2 (9 of 16), and 4 to songs
+  rated 5 (6 of 19). Only 8 songs were rated 4.
+- **Unusual songs are untested.** There were too few fast-but-calm and slow-but-intense
+  songs (2 of each) to say anything about them.
+
+The test can't be reused: those songs are now spent, so testing any change to M3 needs
+new ratings. The scoring script ran once. Its results were saved before it crashed
+printing them, because the Windows console couldn't show a symbol in an artist's name;
+it exited with code 1, and the saved report was read instead of running it again.
 
 **Extra playlists (optional, all off by default):** Genre · BPM range (step size you choose) · Key (Camelot, in wheel order) ·
 Artist · Record label · Release year · Star rating · Track color · Month added
@@ -224,8 +355,64 @@ measured for this, which happens automatically.
 **Review genres:** on the Genres tab, **Review genres...** lists every song with no
 genre or a vague one ("Dance & EDM", "Electronic") next to the app's guess. Select
 songs, pick the right genre, and press **Save to rekordbox** (close rekordbox first; a
-backup is made). Copies of a song change together, and an existing genre with the same
-name is reused. Saved genres become real tags, so later guesses learn from them.
+backup is made). Uncertain songs show "?" with their likeliest genres; select one to see
+why. Copies of a song change together, and an existing genre with the same name is
+reused. Genres you pick become real tags that later guesses learn from. A suggestion
+you save unchanged is remembered as accepted rather than confirmed, so the app doesn't
+learn from its own guesses. It never changes a genre tag without you saving it here.
+
+To see how well guessing works on your own tagged songs, run
+`python evaluate_genres.py` (it only reads your library). Each tagged song is hidden in
+turn, together with its copies and other versions of it, and guessed from the rest.
+`python benchmark_genres.py` compares the old classifier, Discogs-EffNet alone, the
+classifier trained on your tags, release info alone and both combination methods, all on
+the same held-out songs: accuracy and macro-F1 with confidence intervals, per-genre
+precision/recall, confusions, the confusable pairs (Deep vs Tech House and so on),
+automatic coverage against error, calibration and runtime. It uses only cached release
+info unless you add `--metadata`. `python dry_run_genres.py` lists what the app would
+suggest for every song (tag, review or leave unchanged) without changing anything. Both
+reports go to `benchmark_results/`, which git ignores because it lists your songs.
+
+Your rekordbox tags aren't verified, so results measured against them are an estimate.
+For a real measurement, verify some songs by hand with `benchmark_labels.py`:
+
+```
+python benchmark_labels.py candidates [--playlist NAME]   # add songs to check
+python benchmark_labels.py export labels.csv              # fill in verified_genre + evidence
+python benchmark_labels.py import labels.csv --by YOURNAME
+python benchmark_labels.py stats                          # how many per genre (aim: 25)
+python benchmark_genres.py --truth verified               # develop on the dev split
+python benchmark_genres.py --truth verified --split test --final   # once, at the end
+```
+
+About 30% of songs (chosen by title, so every version of a song lands on the same side)
+form a test split that the app never learns from or tunes on; each test run is logged.
+
+To check the energy levels (all read-only; results go to `benchmark_results/`):
+
+```
+python benchmark_energy.py synthetic           # designed test signals (no music needed)
+python benchmark_energy.py measure             # measure your library in every mode
+python benchmark_energy.py library             # checks that need no ratings: agreement
+                                               # between modes, stability, per genre
+python benchmark_energy.py template 60         # a CSV of songs to rate 1-5 by ear
+python benchmark_energy.py evaluate labels.csv # agreement with your ratings
+python energy_labelling.py select              # more songs to rate, in batches (see below)
+python energy_labelling.py status              # how many of them you've rated
+```
+
+`energy_labelling.py select` puts every song you haven't rated into batches of 40,
+calm-sounding candidates first (picked several ways, not only by the current algorithms),
+and sets about a quarter of them aside as a held-out test set before anything is rated.
+The sheets show only artist and title. It never overwrites sheets that exist, and
+`template` won't overwrite a template that already holds ratings.
+
+Rate by listening, without looking at the app's ratings, and judge intensity rather
+than how much you like a song or how loud the file is. `evaluate` reports rank
+correlation (with a confidence interval), exact and within-one-level agreement,
+weighted kappa, a 1-5 confusion table, results per genre and per analysis mode,
+agreement between raters if there are several, and the old algorithm for comparison.
+The synthetic expectations are the author's, not listeners'.
 
 **Songs move when they fit better:** when you re-run, songs already in your playlists
 are checked again. If a song now fits a *different* one of your playlists best (for
@@ -270,6 +457,25 @@ changed in rekordbox after it is undone too. Your library as it was before the u
 saved as `master.before-undo-<date>.db`, so you can change your mind. The library is in
 `%APPDATA%\Pioneer\rekordbox\` on Windows and `~/Library/Pioneer/rekordbox/` on macOS.
 
+Every backup (and every restore) is checked byte for byte against what it copied, and is
+only given its final name once it matches: a backup that fails or is cut off is never
+listed, and nothing is written without a good backup.
+
+**If a change was interrupted** (a crash, power cut, or the app killed while saving):
+rekordbox keeps your playlists in two files, `master.db` and `masterPlaylists6.xml`, and
+they are saved one after the other, so an interrupted save can leave them out of step.
+The app notes each change in `master.organizer-pending.json` (next to the library) before
+writing and removes it once both files are saved. If it finds that note, it says so and
+won't write anything else until you either press **Undo last run...** and restore the
+backup it names (the safe choice; an interrupted Undo can simply be run again), or check
+your library in rekordbox and choose **Keep my library as it is**. Nothing is restored
+automatically. To recover by hand instead: close rekordbox, copy the whole folder
+somewhere safe first, then copy `master.organizer-backup-<date>.db` over `master.db`,
+`master.organizer-backup-<date>.masterPlaylists6.xml` over `masterPlaylists6.xml`, delete
+any `master.db-wal` / `master.db-shm` next to `master.db` (put back the backup's own ones
+if it has them), and delete `master.organizer-pending.json`. Files ending in `.partial`
+or `.restoring` are unfinished copies and can be deleted.
+
 ### From an XML export
 
 If you'd rather not let the app touch your library directly:
@@ -287,9 +493,12 @@ update star ratings on tracks already in your collection, so use direct mode for
 
 ## Audio formats
 
-MP3, WAV, AIFF, FLAC and OGG always work. M4A/AAC/ALAC work when PyAV is available
-(it's bundled in the built apps) or when `ffmpeg` is installed. On macOS they also work
-through the built-in `afconvert`.
+MP3, WAV, AIFF, FLAC and OGG always work. M4A/AAC/ALAC work on macOS through the
+built-in `afconvert`. On Windows they need `ffmpeg` installed (on your PATH), or running
+from source with PyAV installed (`pip install av`). PyAV isn't bundled in the built apps
+because its wheels include GPL-licensed video encoders (x264, x265); see Credits. Songs
+that can't be decoded are skipped (no energy or model guess), never changed; for
+M4A/AAC/ALAC without ffmpeg the log says ffmpeg is needed.
 
 ## Running from source
 
@@ -321,17 +530,29 @@ python app.py
 ```
 
 To start it again later, open a terminal in the folder and run only the `activate`
-line and `python app.py`. To run the tests: `python -m unittest -v`.
+line and `python app.py`. To run the tests: `python -m unittest -v`. The library-safety
+tests (`test_library_safety.py`) run every write path against a throwaway master.db and
+XML built in a temporary folder. To check direct mode against your own library's exact
+format without touching it, close rekordbox and run `python check_database_copy.py`: it
+works on a temporary copy, then confirms your real files are byte-for-byte unchanged.
+A built app can test itself the same way on a throwaway library:
+`"Rekordbox Organizer.exe" --selftest <empty folder> [<folder of audio files>]` runs
+Preview, a real run, a genre save, the interrupted-change guard and Undo on a synthetic
+library inside that folder, tries to decode each audio file, and writes `selftest.json`
+there (see `selftest.py`). It never opens your real library.
 
 ## Building the double-click apps
 
 ```
 pip install -r requirements.txt pyinstaller
 # Windows -> dist/Rekordbox Organizer.exe
-pyinstaller --onefile --windowed --collect-all pyrekordbox --name "Rekordbox Organizer" app.py
+pyinstaller --onefile --windowed --collect-all pyrekordbox --collect-binaries onnxruntime --collect-submodules keyring.backends --exclude-module av --add-data "THIRD_PARTY_LICENSES.md:." --add-data "energy_m3_model.json:." --name "Rekordbox Organizer" app.py
 # macOS   -> dist/Rekordbox Organizer.app
-pyinstaller --windowed --collect-all pyrekordbox --name "Rekordbox Organizer" app.py
+pyinstaller --windowed --collect-all pyrekordbox --collect-binaries onnxruntime --collect-submodules keyring.backends --exclude-module av --add-data "THIRD_PARTY_LICENSES.md:." --add-data "energy_m3_model.json:." --name "Rekordbox Organizer" app.py
 ```
+
+`--exclude-module av` keeps PyAV's bundled FFmpeg (with GPL x264/x265) out of the build;
+the workflow fails if any such library ends up in it anyway.
 
 PyInstaller can only build for the OS it runs on, so GitHub Actions builds both
 (`.github/workflows/build.yml`). To publish a new version as a Release, tag it and
@@ -352,6 +573,21 @@ See [Installing](#installing) for how to get past that.
 ## Credits
 
 Reading and writing the rekordbox database uses [pyrekordbox](https://github.com/dylanljones/pyrekordbox).
+
+Licences of the optional parts (check them before any commercial use or redistribution):
+
+- **Discogs-EffNet** model (MTG, Universitat Pompeu Fabra): CC BY-NC-SA 4.0, free for
+  non-commercial use only; MTG offers a commercial licence on request. The app
+  downloads it on first use rather than shipping it.
+- **YAMNet** (Google; ONNX conversion): Apache-2.0. AudioSet class names: CC BY 4.0.
+- **MusicBrainz** genre and tag data: CC BY-NC-SA 3.0 (core data is CC0).
+- **Discogs** data: subject to the Discogs API Terms of Use. Data provided by Discogs.
+- Optional token storage uses [keyring](https://github.com/jaraco/keyring) (MIT).
+- The builds bundle libsndfile (LGPL-2.1) and other permissively licensed components;
+  see [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md). PyAV/FFmpeg is deliberately
+  left out of the builds (its Windows wheel includes GPL x264/x265), and the build checks
+  that no such library slipped in. Running from source with PyAV installed is fine for
+  your own use.
 
 ## License
 

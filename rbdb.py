@@ -8,7 +8,9 @@ and a backup of the database is made before every change.
 from __future__ import annotations
 
 import datetime
-import glob
+import fnmatch
+import hashlib
+import json
 import logging
 import os
 import re
@@ -44,12 +46,56 @@ def rekordbox_running() -> bool:
 def open_database(path: Optional[str] = None):
     pyrekordbox = _pyrekordbox()
     try:
-        return pyrekordbox.MasterDatabase(path) if path else pyrekordbox.MasterDatabase()
+        db = pyrekordbox.MasterDatabase(path) if path else pyrekordbox.MasterDatabase()
     except FileNotFoundError as exc:
         raise RuntimeError(
             "Couldn't find your rekordbox library on this computer. "
             "Is rekordbox 6 or 7 installed and has it been opened at least once?"
         ) from exc
+    # pyrekordbox's close() ends the session but keeps the file open in a
+    # connection pool; let go of it too, so Undo can swap the file afterwards.
+    session_close = db.close
+
+    def close():
+        try:
+            session_close()
+        finally:
+            db.engine.dispose()
+    db.close = close
+    # Remember whether a commit was attempted: after that, a failure may have
+    # saved the database but not its playlist index (see begin_change).
+    session_commit = db.commit
+    db.commit_started = False
+
+    def commit(*args, **kwargs):
+        db.commit_started = True
+        return session_commit(*args, **kwargs)
+    db.commit = commit
+    if db.playlist_xml is not None:
+        _atomic_playlist_xml(db.playlist_xml)
+    return db
+
+
+def _atomic_playlist_xml(xml) -> None:
+    """Make pyrekordbox save masterPlaylists6.xml whole or not at all.
+
+    Its own save() truncates the file and writes it in place, so a crash
+    mid-write would leave it cut short. Same text and encoding, written to a
+    temporary file first and then renamed over the old one.
+    """
+    def save(path=None, indent=None):
+        target = str(path or xml.path)
+        text = xml.to_string(indent)
+        partial = target + ".partial"
+        try:
+            with open(_long(partial), "w") as fh:      # same open() as pyrekordbox's own save
+                fh.write(text)
+            _replace(partial, target)
+        finally:
+            if _exists(partial):
+                _remove(partial)
+        xml._changed = False
+    xml.save = save
 
 
 def database_path(db) -> str:
@@ -119,81 +165,250 @@ JOURNALS = ("-wal", "-shm")
 BACKUP_GLOB = "master.organizer-backup-*.db"
 
 
+def _long(path: str) -> str:
+    """path, in the form Windows accepts at any length if it's past the usual limit of
+    259 characters. Backup names are up to 59 characters longer than master.db, so a
+    library that opens fine can have backups past it (unless Windows has long paths on)."""
+    if os.name != "nt":
+        return path
+    full = os.path.abspath(path)
+    if len(full) <= 259 or full.startswith("\\\\?\\"):
+        return path
+    if full.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + full[2:]
+    return "\\\\?\\" + full
+
+
+def _exists(path: str) -> bool:
+    return os.path.exists(_long(path))
+
+
+def _remove(path: str) -> None:
+    os.remove(_long(path))
+
+
+def _replace(src: str, dst: str) -> None:
+    os.replace(_long(src), _long(dst))
+
+
+def _matching(folder: str, pattern: str) -> list[str]:
+    """The files in folder that match pattern. glob would read a "[" in the folder's
+    name, or the "?" of the long form, as part of the pattern."""
+    try:
+        names = os.listdir(_long(folder or os.curdir))
+    except OSError:
+        return []
+    return [os.path.join(folder, n) for n in fnmatch.filter(names, pattern)]
+
+
 def _backup_parts(path: str) -> list[str]:
     return [path] + [path + j for j in JOURNALS] + [path[:-3] + ".masterPlaylists6.xml"]
 
 
+def _sha256(path: str) -> str:
+    h = hashlib.sha256()
+    with open(_long(path), "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _copy_verified(src: str, dst: str) -> None:
+    """Copy src to dst via a temporary name; dst appears only once its bytes match src."""
+    partial = dst + ".partial"
+    try:
+        try:
+            shutil.copy2(_long(src), _long(partial))
+        except OSError as exc:
+            exc.filename = exc.filename or partial      # Windows' copy error names no file
+            raise
+        if _sha256(partial) != _sha256(src):
+            raise OSError(f"the copy of {os.path.basename(src)} doesn't match the original")
+        _replace(partial, dst)
+    finally:
+        if _exists(partial):
+            _remove(partial)
+
+
 def backup(db_path: str) -> str:
-    """Copy master.db with its journal files (and the playlist index); keep the newest few."""
+    """Copy master.db with its journal files (and the playlist index); keep the newest few.
+
+    Every file is checked byte-for-byte against the original. The database goes
+    in last, so an interrupted or failed backup is never listed (or used) as
+    one; on any failure this raises and nothing has been changed, so the caller
+    must not go on to write.
+    """
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     folder = os.path.dirname(db_path)
+    # Pieces left by a backup that was cut off (never renamed, so never a usable copy).
+    for stale in _matching(folder, "master.organizer-backup-*.partial"):
+        _remove(stale)
     dest = os.path.join(folder, f"master.organizer-backup-{stamp}.db")
     n = 1
-    while os.path.exists(dest):   # never overwrite an earlier backup
+    while _exists(dest):   # never overwrite an earlier backup
         n += 1
         dest = os.path.join(folder, f"master.organizer-backup-{stamp}-{n}.db")
-    shutil.copy2(db_path, dest)
-    for j in JOURNALS:
-        if os.path.exists(db_path + j):
-            shutil.copy2(db_path + j, dest + j)
+    parts = [(db_path + j, dest + j) for j in JOURNALS if _exists(db_path + j)]
     xml = os.path.join(folder, "masterPlaylists6.xml")
-    if os.path.exists(xml):
-        shutil.copy2(xml, dest[:-3] + ".masterPlaylists6.xml")
+    if _exists(xml):
+        parts.append((xml, dest[:-3] + ".masterPlaylists6.xml"))
+    try:
+        for src, dst in parts + [(db_path, dest)]:
+            _copy_verified(src, dst)
+    except OSError:
+        for _, dst in parts:          # don't leave pieces of a backup that isn't one
+            if _exists(dst) and not _exists(dest):
+                _remove(dst)
+        raise
 
     for path in list_backups(folder)[KEEP_BACKUPS:]:
         for p in _backup_parts(path):
-            if os.path.exists(p):
-                os.remove(p)
+            if _exists(p):
+                _remove(p)
     return dest
+
+
+def _newest_first(paths: list[str]) -> list[str]:
+    """Sort backups by time and then by the -2, -3... added for ones made in the same
+    second (plain name order would put "-2" before the first one)."""
+    def key(path):
+        m = re.search(r"-(\d{8}-\d{6})(?:-(\d+))?\.db$", os.path.basename(path))
+        return (m.group(1), int(m.group(2) or 1)) if m else ("", 0)
+    return sorted(paths, key=key, reverse=True)
 
 
 def list_backups(folder: str) -> list[str]:
     """The app's backups in folder, newest first."""
-    return sorted(glob.glob(os.path.join(folder, BACKUP_GLOB)), reverse=True)
+    return _newest_first(_matching(folder, BACKUP_GLOB))
 
 
 def backup_time(path: str) -> datetime.datetime:
     m = re.search(r"backup-(\d{8}-\d{6})", os.path.basename(path))
     if m:
         return datetime.datetime.strptime(m.group(1), "%Y%m%d-%H%M%S")
-    return datetime.datetime.fromtimestamp(os.path.getmtime(path))
+    return datetime.datetime.fromtimestamp(os.path.getmtime(_long(path)))
+
+
+# A change to the library in progress: written (next to master.db) before the
+# first write and removed only once everything, the database and its playlist
+# index, is saved. Still there means the app stopped part-way (a crash, power
+# cut...), and the database and masterPlaylists6.xml may not match.
+PENDING = "master.organizer-pending.json"
+
+
+def _pending_path(db_path: str) -> str:
+    return os.path.join(os.path.dirname(db_path), PENDING)
+
+
+def begin_change(db_path: str, backup_path: str, what: str = "write") -> None:
+    path = _pending_path(db_path)
+    data = {"what": what, "backup": os.path.basename(backup_path),
+            "started": datetime.datetime.now().isoformat(timespec="seconds")}
+    with open(_long(path + ".partial"), "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    _replace(path + ".partial", path)
+
+
+def end_change(db_path: str) -> None:
+    path = _pending_path(db_path)
+    if _exists(path):
+        _remove(path)
+
+
+def interrupted_change(db_path: str) -> Optional[dict]:
+    """The change that didn't finish, or None. A damaged marker still counts."""
+    path = _pending_path(db_path)
+    if not _exists(path):
+        return None
+    try:
+        with open(_long(path), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {"what": "unknown"}
+    except (OSError, ValueError):
+        return {"what": "unknown"}
+
+
+def interrupted_message(info: dict) -> str:
+    when = f" (started {str(info['started']).replace('T', ' ')})" if info.get("started") else ""
+    backup_name = info.get("backup", "")
+    if info.get("what") == "undo":
+        return (f"The last Undo{when} didn't finish. Your library may be part-restored. "
+                f"Use Undo again and pick the same backup ({backup_name}); the backup itself "
+                "is untouched. Nothing else can be saved until then.")
+    return (f"The last change to your library{when} didn't finish, so the database and its "
+            "playlist index (masterPlaylists6.xml) may not match. Use Undo to put back the "
+            f"backup made just before it ({backup_name or 'the newest one'}). Or, if you've "
+            "checked in rekordbox that everything is fine, choose 'Keep my library as it is' "
+            "in the Undo window. Nothing else can be saved until then.")
 
 
 def restore_backup(backup_path: str, db_path: str) -> str:
     """Put a backup back as the library. rekordbox must be closed.
 
     The current library (with its journal files) is first saved as
-    master.before-undo-<time>.db, so the undo itself can be undone.
-    Returns that file's path.
+    master.before-undo-<time>.db, so the undo itself can be undone. The
+    restored database is checked byte-for-byte against the backup. If it stops
+    part-way, the "change in progress" marker says so and Undo can simply be
+    run again (the backup is only ever read). Returns the saved copy's path.
     """
     folder = os.path.dirname(db_path)
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     keep = os.path.join(folder, f"master.before-undo-{stamp}.db")
-    shutil.copy2(db_path, keep)
-    for j in JOURNALS:
-        if os.path.exists(db_path + j):
-            shutil.copy2(db_path + j, keep + j)
+    n = 1
+    while _exists(keep):
+        n += 1
+        keep = os.path.join(folder, f"master.before-undo-{stamp}-{n}.db")
     xml = os.path.join(folder, "masterPlaylists6.xml")
-    if os.path.exists(xml):
-        shutil.copy2(xml, keep[:-3] + ".masterPlaylists6.xml")
+    current = [(db_path + j, keep + j) for j in JOURNALS if _exists(db_path + j)]
+    if _exists(xml):
+        current.append((xml, keep[:-3] + ".masterPlaylists6.xml"))
+    for src, dst in current + [(db_path, keep)]:
+        _copy_verified(src, dst)
 
-    # Journals first: the library's own must never be paired with the backup.
-    for j in JOURNALS:
-        if os.path.exists(db_path + j):
-            os.remove(db_path + j)
-    shutil.copy2(backup_path, db_path)
-    for j in JOURNALS:
-        if os.path.exists(backup_path + j):
-            shutil.copy2(backup_path + j, db_path + j)
+    # Copy everything next to the library first, so a failed copy (disk full...)
+    # leaves the library untouched; then swap the files in by renaming.
     saved_xml = backup_path[:-3] + ".masterPlaylists6.xml"
-    if os.path.exists(saved_xml):
-        shutil.copy2(saved_xml, xml)
+    sources = [(backup_path, db_path)] + [(backup_path + j, db_path + j) for j in JOURNALS]
+    if _exists(saved_xml):
+        sources.append((saved_xml, xml))
+    staged = {}
+    try:
+        for src, dst in sources:
+            if _exists(src):
+                _copy_verified(src, dst + ".restoring")
+                staged[dst] = dst + ".restoring"
+    except OSError:
+        for tmp in staged.values():
+            _remove(tmp)
+        raise
+    begin_change(db_path, backup_path, "undo")
+    # Order matters if this stops part-way: the library's own journals go first
+    # (they must never be paired with the backup's database), then the database,
+    # then the backup's journals (a backup database without them is older but
+    # consistent; a backup journal next to the wrong database is not).
+    for j in JOURNALS:
+        if _exists(db_path + j):
+            _remove(db_path + j)
+    for dst in [db_path] + [db_path + j for j in JOURNALS] + [xml]:
+        if dst not in staged:
+            continue
+        try:
+            _replace(staged[dst], dst)
+        except PermissionError:
+            # Windows refuses to rename over a file another program holds open;
+            # copy over it in place instead (the staged copy proved the space).
+            shutil.copyfile(_long(staged[dst]), _long(dst))
+            _remove(staged[dst])
+    if _sha256(db_path) != _sha256(backup_path):
+        raise OSError("The restored library doesn't match the backup. Run Undo again; "
+                      f"your library from before the undo is saved as {os.path.basename(keep)}.")
+    end_change(db_path)
 
-    undos = sorted(glob.glob(os.path.join(folder, "master.before-undo-*.db")), reverse=True)
+    undos = _newest_first(_matching(folder, "master.before-undo-*.db"))
     for path in undos[KEEP_BACKUPS:]:
         for p in _backup_parts(path):
-            if os.path.exists(p):
-                os.remove(p)
+            if _exists(p):
+                _remove(p)
     return keep
 
 
