@@ -10,6 +10,7 @@ XML mode runs on a small sample export in a temporary folder.
 import hashlib
 import os
 import shutil
+import sqlite3
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
@@ -265,6 +266,56 @@ class DatabaseWriteTests(DatabaseCase):
             rows, _ = organizer.genre_review(opt=organizer.Options(), **QUIET)
         self.assertEqual(sorted(r.id for r in rows), ["2", "3"])
         self.assertEqual(self.backups(), [])
+
+
+class LeftoverJournalTests(DatabaseCase):
+    """A crashed rekordbox leaves saved changes in master.db-wal. SQLite moves them into
+    master.db when its last connection closes, so looking at a library must not connect to it."""
+
+    def setUp(self):
+        super().setUp()
+        con = sqlite3.connect(self.db)
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA wal_autocheckpoint=0")
+        con.execute("UPDATE djmdContent SET Title='From the journal' WHERE ID='2'")
+        con.commit()
+        crashed = os.path.join(self.dir, "crashed")
+        os.mkdir(crashed)
+        for suffix in ("", "-wal"):
+            shutil.copy2(self.db + suffix, os.path.join(crashed, "master.db" + suffix))
+        con.close()
+        self.db = os.path.join(crashed, "master.db")
+        self.before = self.files()
+
+    def files(self):
+        folder = os.path.dirname(self.db)
+        return {name: (sha(os.path.join(folder, name)),
+                       os.stat(os.path.join(folder, name)).st_mtime_ns)
+                for name in os.listdir(folder)}
+
+    def test_genre_review_leaves_it_alone_and_still_sees_the_journal(self):
+        with mock.patch.object(organizer, "predict", return_value={}):
+            rows, _ = organizer.genre_review(opt=organizer.Options(), **QUIET)
+        self.assertEqual({r.id: r.name for r in rows}["2"], "From the journal")
+        self.assertEqual(self.files(), self.before)
+
+    def test_preview_leaves_it_alone(self):
+        organizer.run(by_bpm(), preview=True, changes=organizer.Changes(), **QUIET)
+        self.assertEqual(self.files(), self.before)
+
+    def test_finding_the_library_leaves_it_alone(self):
+        self.assertEqual(rbdb.library_path(), self.db)
+        self.assertEqual(self.files(), self.before)
+
+    def test_opening_the_app_leaves_it_alone(self):
+        import app
+        import tk_test_root
+        root = tk_test_root.open_root(self)
+        settings = os.path.join(self.dir, "settings.json")
+        with mock.patch.object(app, "settings_path", lambda: settings),                 mock.patch.object(app.App, "check_for_update", lambda _: None):
+            app.App(root)
+            root.update()
+        self.assertEqual(self.files(), self.before)
 
 
 class BackupFailureTests(unittest.TestCase):

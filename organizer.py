@@ -1487,11 +1487,15 @@ def genre_review(xml_path: Optional[str] = None, log: Callable[[str], None] = pr
         _, tracks = load_library(xml_path)
     else:
         import rbdb
-        db = rbdb.open_database()
+        real = rbdb.open_database()
+        # On a copy: closing a connection to the real file can change it (see open_preview_copy).
+        db, work = rbdb.open_preview_copy(real)
+        real.close()
         try:
             tracks, _ = rbdb.load_tracks(db)
         finally:
             db.close()
+            shutil.rmtree(work, ignore_errors=True)
     choices: dict[str, str] = {fam.casefold(): fam for fam, _ in genres.FAMILIES}
     for subs in genres.SUBGENRES.values():
         for sub in subs:

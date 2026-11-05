@@ -409,9 +409,11 @@ def restore_backup(backup_path: str, db_path: str) -> str:
 
 
 def open_preview_copy(db) -> tuple[object, str]:
-    """A copy of the open library to try a run on: (database, temp folder).
+    """A copy of the open library to read or try a run on: (database, temp folder).
 
-    Analysis files are still read from the real library's folder.
+    Analysis files are still read from the real library's folder. Anything that only
+    looks at the library should use this: if rekordbox crashed, saved changes wait in
+    master.db-wal, and SQLite moves them into master.db when its last connection closes.
     """
     import pathlib
     import tempfile
