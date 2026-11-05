@@ -554,6 +554,10 @@ pyinstaller --windowed --collect-all pyrekordbox --collect-binaries onnxruntime 
 `--exclude-module av` keeps PyAV's bundled FFmpeg (with GPL x264/x265) out of the build;
 the workflow fails if any such library ends up in it anyway.
 
+The Windows build installs SQLAlchemy's pure-Python wheel first (see the workflow), because
+Windows Application Control can block its compiled extensions, which stops the app from
+starting. The workflow fails if those extensions end up in the build.
+
 PyInstaller can only build for the OS it runs on, so GitHub Actions builds both
 (`.github/workflows/build.yml`). To publish a new version as a Release, tag it and
 push the tag:
