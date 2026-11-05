@@ -47,13 +47,8 @@ class AppSettingsTests(unittest.TestCase):
     """The real window, with settings.json and the credential store faked."""
 
     def setUp(self):
-        import tkinter as tk
-        try:
-            self.root = tk.Tk()
-        except tk.TclError as exc:
-            self.skipTest(f"no display: {exc}")
-        self.root.withdraw()
-        self.addCleanup(self.root.destroy)
+        import tk_test_root
+        self.root = tk_test_root.open_root(self)
         self.dir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.dir, True)
         self.settings = os.path.join(self.dir, "settings.json")

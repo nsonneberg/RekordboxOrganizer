@@ -538,13 +538,8 @@ class XmlRun(unittest.TestCase):
 
 class Window(unittest.TestCase):
     def setUp(self):
-        import tkinter as tk
-        try:
-            self.root = tk.Tk()
-        except tk.TclError as exc:
-            self.skipTest(f"no display: {exc}")
-        self.root.withdraw()
-        self.addCleanup(self.root.destroy)
+        import tk_test_root
+        self.root = tk_test_root.open_root(self)
         self.dir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.dir, True)
         self.settings = os.path.join(self.dir, "settings.json")
@@ -611,8 +606,17 @@ class Window(unittest.TestCase):
         app = self._make()
         dpi = app.winfo_fpixels("1i")
         self.assertEqual(int(str(app.energy_m3_hint.cget("wraplength"))), round(596 * dpi / 96))
-        self.root.tk.call("tk", "scaling", 2 * 96 / 72)
-        self.assertEqual(int(str(self._make().energy_m3_hint.cget("wraplength"))), 1192)
+        self.addCleanup(self.root.tk.call, "tk", "scaling", self.root.tk.call("tk", "scaling"))
+        # Tk keeps the screen's size in whole millimetres, so the DPI it reports is only
+        # close to the scale asked for, by an amount that depends on the screen's size.
+        for scale in (1, 1.25, 1.5, 2, 3):
+            with self.subTest(scale=scale):
+                self.root.tk.call("tk", "scaling", scale * 96 / 72)
+                app = self._make()
+                dpi = app.winfo_fpixels("1i")
+                self.assertAlmostEqual(dpi, scale * 96, delta=scale * 96 * 0.02)
+                self.assertEqual(int(str(app.energy_m3_hint.cget("wraplength"))),
+                                 round(596 * dpi / 96))
 
     def test_both_saved_ticks_can_still_be_undone(self):
         app = self._make({"energy": True, "energy_m3": True, "energy_experimental": True})

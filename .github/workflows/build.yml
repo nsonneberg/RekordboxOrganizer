@@ -19,6 +19,7 @@ jobs:
           python-version: "3.12"
       - run: pip install -r requirements.txt pyinstaller
       - run: python -m unittest -v
+        timeout-minutes: 15    # about a minute normally; a hang should fail here, not run for hours
 
       - name: Stamp the version (lets the app spot newer releases)
         if: startsWith(github.ref, 'refs/tags/v')
