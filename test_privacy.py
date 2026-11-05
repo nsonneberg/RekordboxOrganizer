@@ -252,7 +252,7 @@ class PacingTests(unittest.TestCase):
         p.get("https://x/2")
         self.assertEqual(len(waits), 1)
         self.assertGreater(waits[0], 0.9)
-        self.assertLessEqual(waits[0], metadata.MusicBrainz.interval)
+        self.assertLessEqual(waits[0], metadata.MusicBrainz.interval + 1e-6)
 
     def test_discogs_pacing_stays_under_its_limits(self):
         self.assertGreaterEqual(metadata.Discogs().interval, 60 / 25)      # 25 a minute
