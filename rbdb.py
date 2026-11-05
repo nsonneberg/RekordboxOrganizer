@@ -18,11 +18,7 @@ import shutil
 from typing import Callable, Optional
 from uuid import uuid4
 
-# SQLAlchemy's compiled speed-ups can be blocked by Windows Smart App Control;
-# the pure-Python fallback is plenty fast for this.
-os.environ.setdefault("DISABLE_SQLALCHEMY_CEXT_RUNTIME", "1")
-
-from organizer import (COLOUR_ORDER, SETS_FOLDER, Plan, Track, folder_path,  # noqa: E402
+from organizer import (COLOUR_ORDER, SETS_FOLDER, Plan, Track, folder_path,
                        same_name, to_camelot)
 
 KEEP_BACKUPS = 3

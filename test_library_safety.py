@@ -15,12 +15,10 @@ import unittest
 import xml.etree.ElementTree as ET
 from unittest import mock
 
-os.environ.setdefault("DISABLE_SQLALCHEMY_CEXT_RUNTIME", "1")
-
-import organizer  # noqa: E402
-import rbdb  # noqa: E402
-from selftest import make_master_db  # noqa: E402
-from test_organizer import SAMPLE  # noqa: E402
+import organizer
+import rbdb
+from selftest import make_master_db
+from test_organizer import SAMPLE
 
 QUIET = dict(log=lambda m: None)
 

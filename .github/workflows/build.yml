@@ -18,6 +18,18 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -r requirements.txt pyinstaller
+
+      # Windows Application Control can block SQLAlchemy's compiled extensions, and the app can't
+      # start without the module. This official wheel has the same code as plain Python instead.
+      - name: Use SQLAlchemy's pure-Python wheel
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          version=$(python -c "from importlib.metadata import version; print(version('sqlalchemy'))")
+          pip download --no-deps --only-binary=:all: --platform any --implementation py --abi none --python-version 3.12 -d pure-wheel "sqlalchemy==$version"
+          pip install --force-reinstall --no-deps pure-wheel/*.whl
+          python -c "from sqlalchemy.util import has_compiled_ext; import sys; sys.exit(has_compiled_ext())"
+
       - run: python -m unittest -v
         timeout-minutes: 15    # about a minute normally; a hang should fail here, not run for hours
 
@@ -47,6 +59,14 @@ jobs:
           fi
           if grep -iE "x264|x265|avcodec|av\.libs|\.dylibs/libav" contents.txt; then
             echo "GPL/FFmpeg libraries found in the build"; exit 1
+          fi
+
+      - name: Check SQLAlchemy's compiled extensions weren't bundled
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          if grep -iE 'sqlalchemy[\\/.].*\.pyd' contents.txt; then
+            echo "::error::SQLAlchemy's compiled extensions are in the build"; exit 1
           fi
 
       # On a throwaway library, never a real one. A failure stops the upload, and so any release.
