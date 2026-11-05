@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 import dataclasses
@@ -92,12 +93,20 @@ class Options:
     custom: list[CustomPlaylist] = field(default_factory=list)
     custom_leftovers: bool = False  # songs matching no rule go to "Everything Else"
     guess_genres: bool = True    # estimate genres for untagged / vaguely tagged songs
+    genre_model: bool = False    # ...also listening with the audio genre model (downloads once)
+    genre_backend: str = "yamnet"   # which model: "yamnet" or "discogs-effnet" (non-commercial)
+    genre_metadata: bool = False    # ...and looking songs up on MusicBrainz (opt-in, online)
+    discogs_lookup: bool = False    # ...and on Discogs too (separate opt-in)
+    discogs_token: str = ""         # optional Discogs token (kept in the OS credential store)
     date_from: str = ""          # only organize songs added on/after this date (YYYY-MM-DD)
     date_to: str = ""            # ...and on/before this one; "" = no limit
     merge_existing: bool = True  # add to same-named folders/playlists instead of replacing
     move_mismatched: bool = True  # ...and move songs that now fit another playlist better
     auto_genres: bool = False    # auto genre detection: a folder per genre family
     energy: bool = False         # listen to the music and score energy 1-5
+    energy_experimental: bool = False  # ...with the experimental algorithm instead of the classic
+    energy_relative: bool = False  # ...experimental only: ranked within this library, not fixed
+    energy_m3: bool = False      # ...with M3, calibrated to one listener's ratings (direct mode)
     energy_ratings: bool = True  # ...and set the star rating to the energy level
     keep_ratings: bool = True    # ...except on tracks that already have a rating
     energy_tags: bool = False    # ...and/or tag it "Energy 1-5" in My Tag (direct mode)
@@ -279,7 +288,7 @@ def _norm_title(s: str) -> str:
 _TITLE_JUNK = re.compile(
     r"^\s*\d{1,3}\s*[.\-)]\s+"                                # "12. ", "07 - "
     r"|[\[(][^\])]*\b(?:free|download|dl|buy|out now)\b[^\])]*[\])]"  # "[FREE DL]"
-    r"|/?\s*'?buy'?\s*=\s*free\b.*$"                          # "/ 'Buy' = FREE MP3!"
+    r"|/?\s*'?buy'?\s*=\s*free\b.*$"                          # "/ 'Buy' = FREE"
     r"|\b(?:free (?:download|dl|mp3))\b.*$"
     r"|\.(?:mp3|m4a|wav|aiff?|flac)$", re.I)
 
@@ -630,7 +639,7 @@ class Evictor:
 
 def build_plan(tracks: list[Track], opt: Options, rules: Optional[list[_Rule]] = None,
                guesses: Optional[dict[str, str]] = None,
-               by_guess: Optional[set] = None) -> Plan:
+               by_guess: Optional[set] = None, review=None) -> Plan:
     plan: Plan = []
 
     if rules is None:
@@ -641,7 +650,7 @@ def build_plan(tracks: list[Track], opt: Options, rules: Optional[list[_Rule]] =
 
     if opt.auto_genres:
         import genres
-        plan.extend(genres.auto_genre_plan(tracks, guesses or {}))
+        plan.extend(genres.auto_genre_plan(tracks, guesses or {}, review))
 
     if opt.energy:
         plan.append(("By Energy", _group(
@@ -870,7 +879,19 @@ def write_library(tree: ET.ElementTree, plan: Plan, folder_name: str, out_path: 
             _set_count(node)
     _set_count(top)
 
-    tree.write(out_path, encoding="UTF-8", xml_declaration=True)
+    # Written in full under a temporary name first, so an interrupted write never
+    # leaves a half-written file where the finished one should be.
+    # The file it replaces is kept as <name>.previous.xml (Undo for XML libraries).
+    partial = out_path + ".partial"
+    try:
+        tree.write(partial, encoding="UTF-8", xml_declaration=True)
+        ET.parse(partial)               # it reads back as XML before anything is replaced
+        if os.path.exists(out_path):
+            shutil.copy2(out_path, previous_output_path(out_path))
+        os.replace(partial, out_path)
+    finally:
+        if os.path.exists(partial):
+            os.remove(partial)
     return created, updated, added, removed
 
 
@@ -915,33 +936,101 @@ def default_output_path(xml_path: str) -> str:
     return base + "_organized.xml"
 
 
+def previous_output_path(out_path: str) -> str:
+    base, _ = os.path.splitext(out_path)
+    return base + ".previous.xml"
+
+
 def analyse_tracks(tracks: list[Track], log: Callable[[str], None],
                    progress: Optional[Callable[[int, int], None]] = None) -> dict[str, dict]:
     """Measure every track (for energy and genre guessing). Returns {id: features}."""
     import energy   # needs numpy + an audio decoder; only loaded when used
 
-    # Prefer rekordbox's own analysis (works for every format, no decoding).
-    # Never mix the two sources: their measurements aren't on the same scale.
+    # Direct mode: the decoded audio, judged where rekordbox's phrase analysis
+    # puts the drops (its colour waveform is too coarse to judge energy on and
+    # is only the fallback). XML mode has no phrase analysis: audio only.
     waveforms = {t.id: t.waveform for t in tracks if t.waveform}
+    audio = {t.id: t.path for t in tracks if t.path}
     if waveforms:
-        return energy.analyse_waveforms(waveforms, log, progress)
-    return energy.analyse_library({t.id: t.path for t in tracks if t.path}, log, progress)
+        return energy.analyse_rekordbox(audio, waveforms, log, progress)
+    return energy.analyse_library(audio, log, progress)
 
 
-def apply_energy(tracks: list[Track], opt: Options, features: dict[str, dict],
-                 log: Callable[[str], None],
-                 guesses: Optional[dict[str, str]] = None) -> dict[str, int]:
-    """Set Track.energy from the measurements; return {track id: new star rating}.
+def model_genres(tracks: list[Track], log: Callable[[str], None],
+                 progress: Optional[Callable[[int, int], None]] = None,
+                 backend: str = "yamnet") -> dict:
+    """The audio genre model's view of each track ({id: ModelResult}); {} if it can't run.
 
-    Star ratings follow the level: the most energetic songs get 5 stars and the
-    calmest 1.
+    Any problem (no internet for the first download, onnxruntime blocked,
+    a broken model file) is logged and genre guessing carries on without it.
     """
+    try:
+        import genre_model
+    except ImportError as exc:
+        log(f"Genre model unavailable ({exc}); guessing genres without it.")
+        return {}
+    problem = genre_model.runtime_problem()
+    if problem:
+        log(f"Genre model unavailable: {problem}. Guessing genres without it.")
+        return {}
+    items = []
+    for t in tracks:
+        if not t.path:
+            continue
+        sections = []
+        if t.waveform:
+            try:
+                import cues
+                import energy
+                _, phrases = cues.read_structure(t.waveform)
+                sections = energy.main_sections(phrases, int(t.length * energy.WAVEFORM_RATE))
+            except Exception:       # damaged analysis: fall back to fixed points
+                sections = []
+        items.append(genre_model.TrackInput(t.id, t.path, float(t.length), sections))
+    try:
+        genre_model.ensure_model(log, backend=backend)
+        return genre_model.analyse_tracks(items, log, progress, backend=backend)
+    except Exception as exc:
+        log(f"Genre model couldn't run ({type(exc).__name__}: {exc}); guessing genres without it.")
+        return {}
+
+
+def metadata_genres(tracks: list[Track], opt: Options, log: Callable[[str], None],
+                    progress: Optional[Callable[[int, int], None]] = None) -> dict:
+    """Release metadata for the tracks ({id: metadata.MetadataResult}); {} on any problem.
+
+    Looked up for every track with a title, tagged ones too: the tagged ones
+    are how the app measures how reliable the metadata is for your library.
+    """
+    try:
+        import metadata
+        from version import VERSION
+        providers = [metadata.MusicBrainz(version=VERSION)]
+        if opt.discogs_lookup:
+            providers.append(metadata.Discogs(opt.discogs_token.strip(), version=VERSION))
+        return metadata.lookup_tracks([t for t in tracks if t.name], providers, log, progress)[0]
+    except Exception as exc:
+        log(f"Release info couldn't be looked up ({type(exc).__name__}: {exc}); "
+            "guessing genres without it.")
+        return {}
+
+
+def predict(library: list[Track], opt: Options, features: dict[str, dict],
+            log: Callable[[str], None], progress: Optional[Callable[[int, int], None]] = None):
+    """Genre predictions for untagged / vague songs: {id: genres.GenrePrediction}."""
+    import genres
+    results = model_genres(library, log, progress, opt.genre_backend) if opt.genre_model else {}
+    meta = metadata_genres(library, opt, log, progress) if opt.genre_metadata else {}
+    return genres.predict_genres(library, features, log, results, genres.load_labels(),
+                                 metadata=meta)
+
+
+def _apply_classic_energy(tracks: list[Track], opt: Options, features: dict[str, dict],
+                          genre_of: dict[str, str], log: Callable[[str], None]) -> dict[str, int]:
+    """The classic (v3) algorithm, as committed: levels by rank in this library."""
     import energy
 
-    guesses = guesses or {}
-    genre_of = {t.id: f"{t.genre} {guesses.get(t.id, '')}" for t in tracks}
-    scores = energy.energy_scores(features, {t.id: t.bpm for t in tracks}, genre_of)
-    levels = energy.levels_from_scores(scores)
+    scores, levels = energy.classic_levels(features, {t.id: t.bpm for t in tracks}, genre_of)
     ratings: dict[str, int] = {}
     counts = [0] * 6
     for t in tracks:
@@ -958,6 +1047,96 @@ def apply_energy(tracks: list[Track], opt: Options, features: dict[str, dict],
         top = max(scores, key=scores.get)
         bottom = min(scores, key=scores.get)
         log(f"  Most energetic: {names.get(top, top)}. Calmest: {names.get(bottom, bottom)}.")
+    return ratings
+
+
+def _apply_m3_energy(tracks: list[Track], opt: Options, features: dict[str, dict],
+                     log: Callable[[str], None]) -> dict[str, int]:
+    """M3 (energy_m3): fixed levels, calibrated to one listener's ratings. A track it
+    can't score gets level 0 and keeps its rating; no other algorithm stands in."""
+    import energy_m3
+
+    for t in tracks:
+        t.energy = 0
+    try:
+        model = energy_m3.load_model()
+    except energy_m3.ModelError as exc:
+        log(f"M3 energy model unavailable, so no energy levels were set and ratings stay "
+            f"as they are. Energy playlists and sets will be empty. {exc}")
+        return {}
+    scored, skipped = energy_m3.score_tracks(tracks, features, model)
+    ratings: dict[str, int] = {}
+    counts = [0] * 6
+    for t in tracks:
+        if t.id in scored:
+            t.energy = scored[t.id][1]
+            counts[t.energy] += 1
+            if opt.energy and opt.energy_ratings and not (opt.keep_ratings and t.rating):
+                t.rating = t.energy
+                ratings[t.id] = t.energy
+    log("Energy levels (M3, calibrated to one listener's ratings of one library): "
+        + ", ".join(f"{i}: {counts[i]}" for i in range(1, 6)))
+    if skipped:
+        names = {t.id: t.name or t.id for t in tracks}
+        log(f"  M3 skipped {len(skipped)} tracks, which keep their ratings:")
+        for why in sorted(set(skipped.values())):
+            ids = [i for i, w in skipped.items() if w == why]
+            more = f" and {len(ids) - 3} more" if len(ids) > 3 else ""
+            log(f"    {len(ids)}: {why}, e.g. " + "; ".join(names[i] for i in ids[:3]) + more)
+    if not scored:
+        log("  M3 couldn't score any track, so energy playlists and sets will be empty. "
+            "Fix the reasons above, or untick M3 to use the classic algorithm.")
+    return ratings
+
+
+def apply_energy(tracks: list[Track], opt: Options, features: dict[str, dict],
+                 log: Callable[[str], None],
+                 guesses: Optional[dict[str, str]] = None) -> dict[str, int]:
+    """Set Track.energy from the measurements; return {track id: new star rating}.
+
+    By default the classic algorithm (energy.classic_levels): tracks are ranked
+    against each other, the most energetic fifth get 5 stars and the calmest 1.
+    With opt.energy_experimental, the experimental one (energy.rate_tracks): a
+    fixed 0-100 scale, or ranked within the library with opt.energy_relative;
+    songs it can't rate reliably get level 0 and keep their rating.
+    With opt.energy_m3, M3 instead of either (see _apply_m3_energy).
+    """
+    import energy
+
+    if opt.energy_m3:
+        return _apply_m3_energy(tracks, opt, features, log)
+    guesses = guesses or {}
+    genre_of = {t.id: f"{t.genre} {guesses.get(t.id, '')}" for t in tracks}
+    if not opt.energy_experimental:
+        return _apply_classic_energy(tracks, opt, features, genre_of, log)
+    results = energy.rate_tracks(features, {t.id: t.bpm for t in tracks}, genre_of,
+                                 relative=opt.energy_relative)
+    ratings: dict[str, int] = {}
+    counts = [0] * 6
+    for t in tracks:
+        r = results.get(t.id)
+        level = r.level if r else 0
+        t.energy = level
+        counts[level] += 1
+        if level and opt.energy and opt.energy_ratings and not (opt.keep_ratings and t.rating):
+            t.rating = level
+            ratings[t.id] = level
+    unmeasured = sum(t.id not in results for t in tracks)
+    review = [t for t in tracks if t.id in results and results[t.id].review]
+    log(("Energy levels (ranked within this library): " if opt.energy_relative
+         else "Energy levels: ") + ", ".join(f"{i}: {counts[i]}" for i in range(1, 6))
+        + (f" ({unmeasured} not analysed)" if unmeasured else ""))
+    names = {t.id: t.name or t.id for t in tracks}
+    if review:
+        log(f"  {len(review)} couldn't be rated reliably and were left as they are, e.g. "
+            + "; ".join(f"{names[t.id]} ({', '.join(results[t.id].warnings[-1:])})"
+                        for t in review[:3]))
+    scores = {i: r.score for i, r in results.items() if r.score is not None}
+    if scores:
+        top = max(scores, key=scores.get)
+        bottom = min(scores, key=scores.get)
+        log(f"  Most energetic: {names.get(top, top)} ({scores[top]:.0f}/100). "
+            f"Calmest: {names.get(bottom, bottom)} ({scores[bottom]:.0f}/100).")
     return ratings
 
 
@@ -994,15 +1173,19 @@ def _organize(tracks: list[Track], opt: Options, log: Callable[[str], None],
             log("Your playlist rules or set use energy, so the app will measure your music.")
         features = analyse_tracks(library, log, progress)
     guesses: dict[str, str] = {}
+    review: set = set()
     if want_guesses:
         import genres
-        guesses = genres.guess_genres(library, features, log)
+        predictions = predict(library, opt, features, log, progress)
+        guesses = genres.confident_labels(predictions)
+        review = {i: (p.label or p.family if p.suggested else "") for i, p in predictions.items()
+                  if not genres.auto_allowed(p) and p.candidates}
     ratings = apply_energy(library, opt, features, log, guesses) if want_energy else {}
     chosen = {t.id for t in tracks}
     ratings = {i: stars for i, stars in ratings.items() if i in chosen}
 
     by_guess: set = set()
-    plan = build_plan(tracks, opt, rules, guesses, by_guess)
+    plan = build_plan(tracks, opt, rules, guesses, by_guess, review)
     if opt.duplicates:
         for group in find_duplicates(tracks):
             keep = group[0]
@@ -1081,6 +1264,11 @@ def run(opt: Options, xml_path: Optional[str] = None, log: Callable[[str], None]
         if opt.energy_tags:
             log("My Tags can only be written straight into rekordbox. Skipping them.")
             opt = dataclasses.replace(opt, energy_tags=False)
+        if opt.energy_m3:
+            log("M3 is off for XML exports: it needs rekordbox's own analysis, which they don't "
+                "include. Using the " + ("experimental" if opt.energy_experimental else "classic")
+                + " algorithm for this run instead.")
+            opt = dataclasses.replace(opt, energy_m3=False)
         changes.names.update((t.id, t.name) for t in tracks)
         plan, ratings, chosen = _organize(tracks, opt, log, progress)
         out_path = default_output_path(xml_path)
@@ -1107,7 +1295,10 @@ def run(opt: Options, xml_path: Optional[str] = None, log: Callable[[str], None]
         raise ValueError("rekordbox is open. Please close it first, then press Run again.")
     log("Opening your rekordbox library ...")
     db = rbdb.open_database()
+    if not preview:
+        _refuse_if_interrupted(db)
     work = None
+    started = False
     if preview:
         real, (db, work) = db, rbdb.open_preview_copy(db)
         real.close()
@@ -1126,7 +1317,7 @@ def run(opt: Options, xml_path: Optional[str] = None, log: Callable[[str], None]
             if rbdb.rekordbox_running():
                 raise ValueError("rekordbox was opened while working. Nothing was changed - "
                                  "close rekordbox and press Run again.")
-            log(f"Backed up your library to {os.path.basename(rbdb.backup(db_path))}")
+            started = _begin_write(db_path, log)
         rbdb.add_hot_cues(db, contents, hot_cues, log, changes,   # saved with the rest
                           colours=opt.cue_colours)
         if opt.energy and opt.energy_tags:
@@ -1137,12 +1328,48 @@ def run(opt: Options, xml_path: Optional[str] = None, log: Callable[[str], None]
         describe_moves(counts[3], plan, tracks, log)
         if plan:
             log(describe_changes(*counts))
+        if started:
+            rbdb.end_change(db_path)
         return db_path
+    except BaseException:
+        if started and not getattr(db, "commit_started", True):
+            rbdb.end_change(db_path)    # failed before saving anything: nothing to recover
+        raise
     finally:
         db.close()
         if work:
-            import shutil
             shutil.rmtree(work, ignore_errors=True)
+
+
+def _refuse_if_interrupted(db) -> None:
+    """Stop if an earlier change didn't finish (see rbdb.begin_change); nothing is written."""
+    import rbdb
+    info = rbdb.interrupted_change(rbdb.database_path(db))
+    if info is not None:
+        db.close()
+        raise ValueError(rbdb.interrupted_message(info))
+
+
+def _begin_write(db_path: str, log: Callable[[str], None]) -> bool:
+    """Back up the library and mark a change as in progress. Raises (writing
+    nothing) if the backup can't be made and checked."""
+    import rbdb
+    try:
+        saved = rbdb.backup(db_path)
+    except OSError as exc:
+        raise ValueError(f"Couldn't back up your library, so nothing was changed: {exc}") from exc
+    log(f"Backed up your library to {os.path.basename(saved)}")
+    rbdb.begin_change(db_path, saved)
+    return True
+
+
+def confidence_text(value: float) -> str:
+    """A model confidence for people: never "100%" or "0%" (it's an estimate)."""
+    if value >= 0.995:
+        return ">99%"
+    if value <= 0.005:
+        return "<1%"
+    return f"{value:.0%}"
 
 
 def summarize_changes(changes: Changes, names: Optional[dict[str, str]] = None) -> str:
@@ -1234,12 +1461,22 @@ class GenreSuggestion:
     artist: str
     bpm: float
     tag: str      # the genre it has now ("" if none)
-    guess: str    # the app's guess ("" if it couldn't tell)
+    guess: str    # the app's confident guess ("" if it couldn't tell)
+    status: str = ""          # "confident" / "suggested" / "uncertain"
+    candidates: list = field(default_factory=list)   # [(family, relative score)], best first
+    reason: str = ""          # why it's uncertain, in words
+    sources: tuple = ()       # evidence used
+    evidence: list = field(default_factory=list)   # [(source, its best family, share, weight)]
+    matched: str = ""         # the release metadata came from
+    suggested_subgenre: str = ""   # a subgenre guess that wasn't assigned automatically
+    method: str = ""          # "calibrated" or "legacy"
+    threshold: Optional[float] = None   # confidence needed to tag automatically
+    suggestion: str = ""      # a clear guess the user must approve (genre not yet proved reliable)
 
 
 def genre_review(xml_path: Optional[str] = None, log: Callable[[str], None] = print,
-                 progress: Optional[Callable[[int, int], None]] = None
-                 ) -> tuple[list[GenreSuggestion], list[str]]:
+                 progress: Optional[Callable[[int, int], None]] = None,
+                 opt: Optional[Options] = None) -> tuple[list[GenreSuggestion], list[str]]:
     """Guesses for every song with no genre or a vague one ("Dance & EDM"), to check by hand.
 
     Returns (suggestions, genre names to offer: the app's genre families plus
@@ -1256,6 +1493,9 @@ def genre_review(xml_path: Optional[str] = None, log: Callable[[str], None] = pr
         finally:
             db.close()
     choices: dict[str, str] = {fam.casefold(): fam for fam, _ in genres.FAMILIES}
+    for subs in genres.SUBGENRES.values():
+        for sub in subs:
+            choices.setdefault(sub.casefold(), sub)
     for t in tracks:
         tag = " ".join(t.genre.split())
         if tag and not genres.is_vague(tag):
@@ -1265,35 +1505,70 @@ def genre_review(xml_path: Optional[str] = None, log: Callable[[str], None] = pr
     if not vague:
         return [], names
     features = analyse_tracks(tracks, log, progress)
-    guesses = genres.guess_genres(tracks, features, log)
-    return [GenreSuggestion(t.id, t.name, t.artist, t.bpm, t.genre, guesses.get(t.id, ""))
-            for t in sorted(vague, key=lambda t: (t.artist.casefold(), t.name.casefold()))], names
+    predictions = predict(tracks, opt or Options(), features, log, progress)
+    out = []
+    for t in sorted(vague, key=lambda t: (t.artist.casefold(), t.name.casefold())):
+        p = predictions.get(t.id)
+        if p is None:
+            out.append(GenreSuggestion(t.id, t.name, t.artist, t.bpm, t.genre, ""))
+            continue
+        out.append(GenreSuggestion(t.id, t.name, t.artist, t.bpm, t.genre,
+                                   p.label if genres.auto_allowed(p) else "", p.status,
+                                   list(p.candidates), p.reason, tuple(p.sources),
+                                   list(p.evidence), p.matched, p.suggested_subgenre,
+                                   p.method, p.threshold,
+                                   p.label if p.suggested else ""))
+    return out, names
 
 
 def save_genres(new: dict[str, str], log: Callable[[str], None] = print,
-                preview: bool = False, changes: Optional[Changes] = None) -> str:
-    """Write {track id: genre} into rekordbox (backed up first). Returns the library path."""
+                preview: bool = False, changes: Optional[Changes] = None,
+                suggested: Optional[dict[str, str]] = None) -> str:
+    """Write {track id: genre} into rekordbox (backed up first). Returns the library path.
+
+    suggested: {track id: the app's guess or suggestion shown for it}. A
+    genre saved unchanged from it is remembered as "accepted" (not learned
+    from); anything else the user picked is a "corrected" label. Only the
+    songs in `new` are changed; every other tag is left exactly as it is.
+    """
     import rbdb
     if not preview and rbdb.rekordbox_running():
         raise ValueError("rekordbox is open. Please close it first, then save again.")
     db = rbdb.open_database()
     db_path = rbdb.database_path(db)
+    if not preview:
+        _refuse_if_interrupted(db)
     work = None
+    started = False
     if preview:
         real, (db, work) = db, rbdb.open_preview_copy(db)
         real.close()
     try:
         _, contents = rbdb.load_tracks(db)
+        original = {tid: (contents[tid].GenreName or "").strip() if tid in contents else ""
+                    for tid in new}
         if not preview:
-            log(f"Backed up your library to {os.path.basename(rbdb.backup(db_path))}")
+            started = _begin_write(db_path, log)
         rbdb.write_genres(db, contents, new, log, changes)
         if preview:
             db.rollback()
         else:
             db.commit()
+            rbdb.end_change(db_path)
+            import genres
+            suggested = suggested or {}
+            try:
+                genres.record_labels({tid: (genre, "accepted" if suggested.get(tid) == genre
+                                            else "corrected", original[tid])
+                                      for tid, genre in new.items()})
+            except OSError as exc:
+                log(f"  (Couldn't remember which genres you chose: {exc})")
         return db_path
+    except BaseException:
+        if started and not getattr(db, "commit_started", True):
+            rbdb.end_change(db_path)
+        raise
     finally:
         db.close()
         if work:
-            import shutil
             shutil.rmtree(work, ignore_errors=True)

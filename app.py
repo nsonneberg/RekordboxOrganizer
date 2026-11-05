@@ -45,6 +45,20 @@ def settings_path() -> str:
     return os.path.join(organizer.app_data_dir(), "settings.json")
 
 
+def write_settings(data: dict) -> None:
+    """Write settings.json whole or not at all (a crash never leaves half a file)."""
+    path = settings_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    partial = path + ".partial"
+    try:
+        with open(partial, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(partial, path)
+    finally:
+        if os.path.exists(partial):
+            os.remove(partial)
+
+
 class ScrollFrame(ttk.Frame):
     """A frame with a vertical scrollbar; put widgets in .inner."""
 
@@ -121,9 +135,10 @@ class App(ttk.Frame):
         self.tab = 0
         defaults = organizer.Options(custom_enabled=True)
         self.vars = {name: tk.BooleanVar(value=getattr(defaults, name)) for name in (
-            "custom_enabled", "custom_leftovers", "guess_genres", "auto_genres", "merge_existing",
+            "custom_enabled", "custom_leftovers", "guess_genres", "genre_model", "genre_metadata", "discogs_lookup", "auto_genres",
+            "merge_existing",
             "move_mismatched",
-            "energy", "energy_ratings", "keep_ratings", "energy_tags",
+            "energy", "energy_experimental", "energy_relative", "energy_m3", "energy_ratings", "keep_ratings", "energy_tags",
             "phrase_cues", "cue_colours", "memory_cues", "set_build",
             "genre", "bpm", "key", "artist", "label", "year", "rating", "colour",
             "date_added", "duplicates", "missing_files", "missing_info", "never_played")}
@@ -137,13 +152,20 @@ class App(ttk.Frame):
             "set_length": tk.IntVar(value=defaults.set_length),
             "set_genres": tk.StringVar(value=defaults.set_genres),
             "set_bpm": tk.StringVar(value=defaults.set_bpm),
+            "genre_backend": tk.StringVar(value=defaults.genre_backend),
+            "discogs_token": tk.StringVar(value=defaults.discogs_token),
         }
         self.playlist_count = tk.IntVar(value=len(EXAMPLE_PLAYLISTS))
         self.rows: list[PlaylistRow] = []
         # Remembers rows removed by lowering the count, so raising it brings them back.
         self.row_memory: list[organizer.CustomPlaylist] = list(EXAMPLE_PLAYLISTS)
 
+        self.metadata_consent = ""          # date the user agreed to MusicBrainz lookups
+        self.discogs_consent = ""           # ...and, separately, to Discogs lookups
+        self.legacy_token = ""              # a plain-text token kept where it was (no keyring)
         self.load_settings()
+        self.vars["genre_metadata"].trace_add("write", lambda *_: self._consent("genre_metadata"))
+        self.vars["discogs_lookup"].trace_add("write", lambda *_: self._consent("discogs_lookup"))
         self._build()
         self.grid(sticky="nsew")
         master.columnconfigure(0, weight=1)
@@ -152,6 +174,7 @@ class App(ttk.Frame):
             var.trace_add("write", lambda *_: self._sync_states())
         self.playlist_count.trace_add("write", lambda *_: self._resize_rows())
         self._sync_states()
+        self.working = False
         master.protocol("WM_DELETE_WINDOW", self.on_close)
 
     # ------------------------------------------------------------------ UI --
@@ -166,7 +189,9 @@ class App(ttk.Frame):
 
     @staticmethod
     def _hint(parent, text, row, col=0, **kw):
-        label = ttk.Label(parent, text=text, foreground="gray", wraplength=640, justify="left")
+        # wraplength is in real pixels, so it grows with the display scaling like the text does.
+        wrap = round(kw.pop("wrap", 640) * parent.winfo_fpixels("1i") / 96)
+        label = ttk.Label(parent, text=text, foreground="gray", wraplength=wrap, justify="left")
         label.grid(row=row, column=col, columnspan=kw.pop("columnspan", 1), sticky="w",
                    pady=kw.pop("pady", (2, 6)), **kw)
         return label
@@ -346,9 +371,20 @@ class App(ttk.Frame):
         self.energy_tags_cb = self._check(tab, "energy_tags",
                                           "Tag it 'Energy 1-5' in My Tag (your stars stay yours "
                                           "if you untick the star rating)", 3, padx=(22, 0))
+        self.energy_experimental_cb = self._check(
+            tab, "energy_experimental", "Use the experimental algorithm (a fixed 0-100 scale; "
+            "it matched one listener's ratings much worse)", 4, padx=(22, 0))
+        self.energy_relative_cb = self._check(
+            tab, "energy_relative", "Rank against my library instead (5 = my most energetic "
+            "20%; levels then change as the library changes)", 5, padx=(44, 0))
+        self.energy_m3_cb = self._check(
+            tab, "energy_m3", "Use M3 instead (calibrated to one listener's ratings)", 6,
+            padx=(22, 0))
+        # Narrower by its indent, so switching source (a longer text) never needs a wider window.
+        self.energy_m3_hint = self._hint(tab, "", 7, padx=(44, 0), wrap=596)
         self._hint(tab, "Judged in each track's drops and choruses with rekordbox's own "
                         "analysis. 5 = your most energetic 20%, 1 = your calmest. A 'By Energy' "
-                        "folder is made too.", 4)
+                        "folder is made too.", 8)
 
     def _tab_cues(self, tab):
         self.cues_cb = self._check(tab, "phrase_cues",
@@ -367,17 +403,43 @@ class App(ttk.Frame):
 
     def _tab_genres(self, tab):
         self._check(tab, "guess_genres", "Guess genres for untagged / vague songs", 0)
-        self._check(tab, "auto_genres", "Auto genre detection (a folder per genre)", 1)
-        self._hint(tab, "rekordbox doesn't detect genre, so guesses are estimates from BPM and "
-                        "sound, learned from your tagged songs. Guessed songs go in "
-                        "'(detected)' playlists so you can check them.", 2)
+        self._check(tab, "genre_model", "Listen with an audio genre model (runs on this "
+                                        "computer; downloads once)", 1, padx=(22, 0))
+        models = ttk.Frame(tab)
+        models.grid(row=2, column=0, sticky="w", padx=(44, 0))
+        ttk.Radiobutton(models, text="Discogs-EffNet: 400 electronic styles, 18 MB "
+                                     "(free for non-commercial use only)",
+                        variable=self.values["genre_backend"],
+                        value="discogs-effnet").pack(anchor="w")
+        ttk.Radiobutton(models, text="YAMNet: general sounds, 16 MB (any use)",
+                        variable=self.values["genre_backend"], value="yamnet").pack(anchor="w")
+        self._check(tab, "genre_metadata", "Look songs up on MusicBrainz (online; sends "
+                                           "artist and title)", 3, padx=(22, 0))
+        token = ttk.Frame(tab)
+        token.grid(row=4, column=0, sticky="w", padx=(44, 0))
+        ttk.Checkbutton(token, text="Also Discogs", variable=self.vars["discogs_lookup"]
+                        ).pack(side="left")
+        ttk.Label(token, text="  token (optional):").pack(side="left")
+        ttk.Entry(token, width=30, show="*",
+                  textvariable=self.values["discogs_token"]).pack(side="left", padx=4)
+        self._check(tab, "auto_genres", "Auto genre detection (a folder per genre)", 5)
+        self._hint(tab, "rekordbox doesn't detect genre, so guesses are estimates combining "
+                        "what the music sounds like (with a model), which of your tagged songs "
+                        "it resembles and, if looked up, the release's genres. Each source "
+                        "counts as much as it proved right on your own tagged songs. BPM alone "
+                        "is never enough. Guesses for genres that have proved reliable go in "
+                        "'(detected)' playlists. Clear guesses for genres that haven't yet go "
+                        "in 'Needs Review' as '(suggested)'; unclear ones, or where sources "
+                        "disagree, go in 'Needs Review'. Tags are only written when you save "
+                        "them in Review genres.", 6)
         row = ttk.Frame(tab)
-        row.grid(row=3, column=0, sticky="w", pady=(10, 0))
+        row.grid(row=7, column=0, sticky="w", pady=(10, 0))
         self.review_btn = ttk.Button(row, text="Review genres...", command=self.review_genres)
         self.review_btn.pack(side="left")
         ttk.Label(row, text="Check the guesses and save the right genres into rekordbox.",
                   foreground="gray").pack(side="left", padx=(10, 0))
-        self._hint(tab, "Saved genres become real tags, so every later guess learns from them.", 4)
+        self._hint(tab, "Genres you pick become real tags that later guesses learn from. "
+                        "Suggestions you save unchanged aren't learned from.", 5)
 
     def _tab_set(self, tab):
         self._check(tab, "set_build", "Build a set: one playlist in mixable order", 0)
@@ -453,6 +515,19 @@ class App(ttk.Frame):
         self.colours_cb.configure(state=on(not xml and v["phrase_cues"]))
         self.undo_btn.configure(state=on(not xml))
         self.energy_ratings_cb.configure(state=on(v["energy"]))
+        m3 = v["energy_m3"] and not xml      # an XML run can't use it; the tick is kept
+        self.energy_experimental_cb.configure(state=on(v["energy"] and not m3))
+        self.energy_relative_cb.configure(state=on(v["energy"] and v["energy_experimental"]
+                                                   and not m3))
+        self.energy_m3_cb.configure(state=on(v["energy"] and not xml
+                                             and (m3 or not v["energy_experimental"])))
+        self.energy_m3_hint.configure(text=(
+            "Off for XML exports: M3 needs rekordbox's own analysis, which they don't include. "
+            "This source uses the " + ("experimental" if v["energy_experimental"] else "classic")
+            + " algorithm instead. Your choice comes back when you switch to rekordbox."
+            if xml else
+            "Fixed levels that may not match your ears. Works straight from rekordbox only; "
+            "songs it can't score keep their rating."))
         self.keep_ratings_cb.configure(state=on(v["energy"] and v["energy_ratings"]))
         self.energy_tags_cb.configure(state=on(v["energy"] and not xml))
         custom = on(v["custom_enabled"])
@@ -474,7 +549,7 @@ class App(ttk.Frame):
         if any(v[k] for k in extras) or v["auto_genres"]:
             doing.append("extra playlists")
         if v["energy"]:
-            doing.append("energy" + (" + stars" if v["energy_ratings"] else "")
+            doing.append("energy" + (" (M3)" if m3 else "") + (" + stars" if v["energy_ratings"] else "")
                          + (" + My Tag" if v["energy_tags"] and not xml else ""))
         if not xml and (v["phrase_cues"] or v["memory_cues"]):
             doing.append("cues")
@@ -511,6 +586,19 @@ class App(ttk.Frame):
         values = dict(data.get("values", {}))
         for key in ("bpm_step", "min_tracks"):      # saved at the top level before 1.2
             values.setdefault(key, data.get(key))
+        if isinstance(data.get("metadata_consent"), str):
+            self.metadata_consent = data["metadata_consent"]
+        if isinstance(data.get("discogs_consent"), str):
+            self.discogs_consent = data["discogs_consent"]
+        # Online lookups need an explicit yes per provider (a setting saved before
+        # the consent question existed doesn't count).
+        if not self.metadata_consent:
+            self.vars["genre_metadata"].set(False)
+        if not self.discogs_consent:
+            self.vars["discogs_lookup"].set(False)
+        values.pop("discogs_token", None)
+        token = self._migrate_token(data)
+        self.values["discogs_token"].set(token)
         for key, var in self.values.items():
             value = values.get(key)
             if isinstance(var, tk.IntVar) and isinstance(value, int) and not isinstance(value, bool):
@@ -539,17 +627,88 @@ class App(ttk.Frame):
             "date_to": self.date_to.get(),
             "last_run": self.last_run,
             "tab": self._current_tab(),
-            "values": self._values(),
+            "values": self._saved_values(),
             "playlists": [vars(p) for p in rows],
         }
+        if self.metadata_consent:
+            data["metadata_consent"] = self.metadata_consent
+        if self.discogs_consent:
+            data["discogs_consent"] = self.discogs_consent
         try:
-            os.makedirs(os.path.dirname(settings_path()), exist_ok=True)
-            with open(settings_path(), "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
+            write_settings(data)
         except OSError:
             pass   # settings are a convenience; never block the user over them
 
+    def _saved_values(self) -> dict:
+        """The settings to write to settings.json: never the Discogs token."""
+        import credentials
+        values = self._values()
+        token = values.pop("discogs_token", "").strip()
+        if token != self.legacy_token.strip():
+            self.legacy_token = ""
+            if not credentials.set_secret(credentials.DISCOGS_TOKEN, token) and token:
+                self.log("No credential store on this computer: the Discogs token works "
+                         "until you close the app but isn't saved.")
+        if self.legacy_token:
+            values["discogs_token"] = self.legacy_token     # unchanged, kept where it was
+        return values
+
+    def _migrate_token(self, data: dict) -> str:
+        """The Discogs token: from the credential store, moving an old plain-text one there.
+
+        A token found in settings.json (saved by an earlier build) is moved into
+        the operating system's credential store and removed from the file. If
+        there's no credential store it stays where it was, so it isn't lost.
+        """
+        import credentials
+        plain = (data.get("values") or {}).get("discogs_token")
+        if isinstance(plain, str) and plain.strip():
+            # set_secret reads the token back, so the plain copy is only removed
+            # once the credential store is known to hold it.
+            if credentials.set_secret(credentials.DISCOGS_TOKEN, plain.strip()):
+                try:
+                    data["values"].pop("discogs_token", None)
+                    write_settings(data)
+                except OSError:
+                    pass        # the old file is intact (written whole or not at all)
+                return plain.strip()
+            self.legacy_token = plain.strip()
+            return self.legacy_token
+        return credentials.get_secret(credentials.DISCOGS_TOKEN)
+
+    def _consent(self, key: str):
+        """Ask once per provider before its online lookups are switched on."""
+        discogs = key == "discogs_lookup"
+        attr = "discogs_consent" if discogs else "metadata_consent"
+        if not self.vars[key].get() or getattr(self, attr):
+            return
+        site = "Discogs (api.discogs.com)" if discogs else "MusicBrainz (musicbrainz.org)"
+        ok = messagebox.askyesno(
+            APP_NAME,
+            f"Looking songs up on {site} sends it each song's artist and title (without "
+            "the remix or edit name), for songs being guessed and your tagged ones (used to "
+            "check how reliable the lookups are). Like any website it also sees your IP "
+            "address, and the app's name and version"
+            + (", plus your Discogs token if you entered one" if discogs else "")
+            + ". Nothing else is sent: no audio, file names, lengths or other library data. "
+            "Answers are kept on this computer ("
+            + ("for at most 6 hours" if discogs else "for up to 180 days")
+            + "). Genre data from this site is "
+            + ("subject to the Discogs API terms" if discogs else
+               "licensed for non-commercial use (CC BY-NC-SA)")
+            + ".\n\nTurn on these lookups?", parent=self.master)
+        if ok:
+            import datetime
+            setattr(self, attr, datetime.date.today().isoformat())
+        else:
+            self.vars[key].set(False)
+
     def on_close(self):
+        if self.working and not messagebox.askyesno(
+                APP_NAME, "The app is still working. If it's saving to your library, closing "
+                          "now could leave it half-saved (Undo can then put back the backup). "
+                          "Close anyway?", default="no"):
+            return
         self.save_settings()
         self.master.destroy()
 
@@ -590,6 +749,7 @@ class App(ttk.Frame):
     def collect_options(self) -> organizer.Options:
         opt = organizer.Options(**{k: v.get() for k, v in self.vars.items()}, **self._values())
         opt.custom = [row.get() for row in self.rows]
+        opt.energy_m3 = opt.energy_m3 and self.source.get() != "xml"
         opt.folder_name = self.folder_name.get().strip() or "Organized"
         mode = self.date_mode.get()
         if mode == "since_last":
@@ -698,6 +858,12 @@ class App(ttk.Frame):
             if not xml_path or not os.path.isfile(xml_path):
                 messagebox.showwarning(APP_NAME, "Please choose your rekordbox XML file first.")
                 return
+        values = self._values()
+        opt = organizer.Options(guess_genres=True, genre_model=self.vars["genre_model"].get(),
+                                genre_backend=values["genre_backend"],
+                                genre_metadata=self.vars["genre_metadata"].get(),
+                                discogs_lookup=self.vars["discogs_lookup"].get(),
+                                discogs_token=values["discogs_token"])
         self._busy(True)
         self.review_btn.configure(state="disabled")
         self.log("Looking for songs with no genre or a vague one ...")
@@ -708,7 +874,7 @@ class App(ttk.Frame):
         def work():
             try:
                 found.put(("ok", organizer.genre_review(
-                    xml_path, log=lambda m: found.put(("log", m)))))
+                    xml_path, log=lambda m: found.put(("log", m)), opt=opt)))
             except Exception as exc:
                 found.put(("error", str(exc)))
 
@@ -743,16 +909,21 @@ class App(ttk.Frame):
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(1, weight=1)
         ttk.Label(frame, wraplength=760, justify="left",
-                  text="These songs have no genre or a vague one. 'Save as' starts as the "
-                       "app's guess: select songs and pick the right genre, or Clear the ones "
-                       "you'd rather leave alone. Copies of a song change together."
+                  text="These songs have no genre or a vague one; songs that already have a "
+                       "specific genre are never listed or changed. 'Save as' starts as the "
+                       "app's guess only for genres that have proved reliable on your tagged "
+                       "songs. '(suggested)' is a clear guess for a genre that hasn't proved "
+                       "itself yet: select it and press 'Accept suggestions' (or Apply) to "
+                       "approve it. '?' means it isn't sure, with the likeliest genres in "
+                       "brackets. Clear the ones you'd rather leave alone. Copies of a song "
+                       "change together."
                   ).grid(row=0, column=0, columnspan=2, sticky="w")
 
         cols = ("song", "artist", "bpm", "tag", "guess", "save")
         tree = ttk.Treeview(frame, columns=cols, show="headings", height=16)
         for col, text, width in (("song", "Song", 300), ("artist", "Artist", 140),
                                  ("bpm", "BPM", 50), ("tag", "Genre now", 110),
-                                 ("guess", "Guess", 100), ("save", "Save as", 120)):
+                                 ("guess", "Guess", 170), ("save", "Save as", 120)):
             tree.heading(col, text=text)
             tree.column(col, width=width, anchor="e" if col == "bpm" else "w",
                         stretch=col == "song")
@@ -769,10 +940,18 @@ class App(ttk.Frame):
                                                      0, 0, "", "", 0, ""))
             copies.setdefault(key, []).append(r.id)
         copies_of = {i: ids for ids in copies.values() for i in ids}
+        def shown_guess(r):
+            if r.guess:
+                return r.guess
+            if r.suggestion:
+                return f"{r.suggestion} (suggested)"
+            options = " / ".join(f for f, _ in r.candidates[:2])
+            return f"? ({options})" if options else "?"
+
         for r in rows:
             tree.insert("", "end", iid=r.id, values=(
                 r.name, r.artist, f"{r.bpm:.0f}" if r.bpm else "", r.tag or "(none)",
-                r.guess or "?", r.guess))
+                shown_guess(r), r.guess))
 
         controls = ttk.Frame(frame)
         controls.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
@@ -782,6 +961,8 @@ class App(ttk.Frame):
                                                                                   padx=(6, 0))
         count = ttk.Label(frame, foreground="gray")
         count.grid(row=3, column=0, sticky="w", pady=(8, 0))
+        why = ttk.Label(frame, foreground="gray", wraplength=760, justify="left")
+        why.grid(row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         def refresh():
             for i, value in save_as.items():
@@ -806,10 +987,56 @@ class App(ttk.Frame):
                    command=lambda: (save_as.update({r.id: r.guess for r in rows}), refresh())
                    ).pack(side="left", padx=(18, 0))
 
+        def accept_suggestions():
+            for i in selected():
+                if by_id[i].suggestion:
+                    save_as[i] = by_id[i].suggestion
+            refresh()
+
+        ttk.Button(controls, text="Accept suggestions (selected)",
+                   command=accept_suggestions).pack(side="left", padx=(6, 0))
+
+        def explain(r) -> str:
+            if not r.candidates:
+                return "Nothing to go on for this song (no audio analysis or BPM)."
+            how = {"copy": "a tagged copy", "model": "the audio model",
+                   "library": "your tagged songs", "sound": "your tagged songs (waveform)",
+                   "metadata": "release info", "tempo": "tempo", "tag": "the current tag"}
+            if r.method == "calibrated":
+                ranked = ", ".join(f"{f} {organizer.confidence_text(s)}" for f, s in r.candidates[:3])
+                text = (f"Model confidence: {ranked}. This is the combining model's own "
+                        "estimate, fitted on your tagged songs. It isn't a measured hit rate "
+                        "and isn't a guarantee: a guess can be wrong even near 100%, "
+                        "especially when the sources all hear the same thing.")
+            else:
+                ranked = ", ".join(f"{f} {s:.2f}" for f, s in r.candidates[:3])
+                text = f"Relative scores (not probabilities): {ranked}."
+            if r.evidence:
+                # Each source's own answer and how much it counted (fitted on
+                # your tagged songs x how good its match is).
+                text += " " + "; ".join(f"{how.get(s, s)}: {fam} (counts {w:.2f})"
+                                        for s, fam, _, w in r.evidence) + "."
+            else:
+                used = ", ".join(how[s] for s in r.sources if s in how)
+                if used:
+                    text += f" Based on {used}."
+            if r.suggested_subgenre and r.suggested_subgenre not in r.guess:
+                text += (f" Possible subgenre: {r.suggested_subgenre} (not assigned: subgenre "
+                         "guesses haven't yet proved reliable on your tagged songs).")
+            if r.matched:
+                text += f" Release info from {r.matched.removeprefix('matched ')}."
+                if "MusicBrainz" in r.matched:
+                    text += " Genres from MusicBrainz (CC BY-NC-SA 3.0)."
+                if "Discogs" in r.matched:
+                    text += " Data provided by Discogs."
+            return text + (f" {r.reason}" if r.reason else "")
+
         def pick_up(_event=None):
             ids = list(tree.selection())
             if ids:
-                genre.set(save_as.get(ids[0]) or by_id[ids[0]].guess)
+                genre.set(save_as.get(ids[0]) or by_id[ids[0]].guess
+                          or by_id[ids[0]].suggestion)
+                why.configure(text=explain(by_id[ids[0]]))
 
         tree.bind("<<TreeviewSelect>>", pick_up)
 
@@ -825,7 +1052,9 @@ class App(ttk.Frame):
                               "saved first, and Undo last run can put it back.", parent=win):
                 return
             try:
-                organizer.save_genres(new, log=self.log)
+                organizer.save_genres(new, log=self.log,
+                                      suggested={r.id: r.guess or r.suggestion for r in rows
+                                                 if r.guess or r.suggestion})
             except Exception as exc:
                 messagebox.showerror(APP_NAME, str(exc), parent=win)
                 return
@@ -933,6 +1162,7 @@ class App(ttk.Frame):
         self.after(100, poll)
 
     def _busy(self, busy: bool):
+        self.working = busy
         for w in (self.run_btn, self.preview_btn, self.undo_btn):
             w.configure(state="disabled" if busy else "normal")
         if not busy:
@@ -1006,9 +1236,27 @@ class App(ttk.Frame):
         ttk.Label(frame, foreground="gray", wraplength=440, justify="left",
                   text="Your library as it is now is kept as a copy too, so this can be "
                        "reversed.").pack(anchor="w", pady=(6, 0))
+        interrupted = rbdb.interrupted_change(db_path)
+        if interrupted is not None:
+            ttk.Label(frame, foreground="#b00020", wraplength=440, justify="left",
+                      text=rbdb.interrupted_message(interrupted)).pack(anchor="w", pady=(8, 0))
         buttons = ttk.Frame(frame)
         buttons.pack(anchor="e", pady=(10, 0))
         ttk.Button(buttons, text="Cancel", command=win.destroy).pack(side="left")
+
+        def keep_as_is():
+            if not messagebox.askyesno(
+                    APP_NAME, "Only do this if you've opened rekordbox and checked your "
+                              "playlists and tags look right. Keep the library as it is?",
+                    parent=win):
+                return
+            rbdb.end_change(db_path)
+            win.destroy()
+            self.log("Kept your library as it is; saving is allowed again.")
+
+        if interrupted is not None:
+            ttk.Button(buttons, text="Keep my library as it is",
+                       command=keep_as_is).pack(side="left", padx=(8, 0))
 
         def restore():
             chosen = backups[box.curselection()[0]] if box.curselection() else backups[0]
@@ -1040,6 +1288,9 @@ class App(ttk.Frame):
 
 
 def main():
+    if len(sys.argv) >= 3 and sys.argv[1] == "--selftest":
+        import selftest     # a throwaway library only; see selftest.py
+        sys.exit(selftest.run(sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else ""))
     if sys.platform == "win32":
         try:  # crisp text on high-DPI screens
             import ctypes

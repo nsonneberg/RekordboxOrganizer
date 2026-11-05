@@ -8,6 +8,7 @@ on:
 jobs:
   build:
     strategy:
+      fail-fast: false    # a failure on one OS shouldn't hide the other's result; release still needs both
       matrix:
         os: [windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
@@ -26,13 +27,160 @@ jobs:
 
       - name: Build Windows exe
         if: runner.os == 'Windows'
-        run: pyinstaller --noconfirm --onefile --windowed --collect-all pyrekordbox --name "Rekordbox Organizer" app.py
+        # PyAV is left out: its wheels bundle GPL x264/x265 encoders (see README, Credits).
+        run: pyinstaller --noconfirm --onefile --windowed --collect-all pyrekordbox --collect-binaries onnxruntime --collect-submodules keyring.backends --exclude-module av --add-data "THIRD_PARTY_LICENSES.md:." --add-data "energy_m3_model.json:." --name "Rekordbox Organizer" app.py
 
       - name: Build macOS app
         if: runner.os == 'macOS'
         run: |
-          pyinstaller --noconfirm --windowed --collect-all pyrekordbox --name "Rekordbox Organizer" app.py
+          pyinstaller --noconfirm --windowed --collect-all pyrekordbox --collect-binaries onnxruntime --collect-submodules keyring.backends --exclude-module av --add-data "THIRD_PARTY_LICENSES.md:." --add-data "energy_m3_model.json:." --name "Rekordbox Organizer" app.py
           cd dist && ditto -c -k --keepParent "Rekordbox Organizer.app" "Rekordbox Organizer-macOS.zip"
+
+      - name: Check no GPL codec libraries were bundled
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            pyi-archive_viewer --list "dist/Rekordbox Organizer.exe" > contents.txt
+          else
+            find "dist/Rekordbox Organizer.app" > contents.txt
+          fi
+          if grep -iE "x264|x265|avcodec|av\.libs|\.dylibs/libav" contents.txt; then
+            echo "GPL/FFmpeg libraries found in the build"; exit 1
+          fi
+
+      # On a throwaway library, never a real one. A failure stops the upload, and so any release.
+      - name: Self-test the packaged app
+        shell: python
+        timeout-minutes: 30
+        run: |
+          import json, os, subprocess, sys, tempfile
+
+          EXPECTED = {
+              "preview changes nothing", "preview makes no backup", "preview lists changes",
+              "run made one backup", "backup is the library as it was", "run changed the database",
+              "playlist index updated and valid", "no change left marked in progress",
+              "genre save wrote only the chosen song", "genre save made a backup",
+              "an unfinished change blocks the next write",
+              "undo restores the exact database and playlist index",
+              "undo kept the library from before it", "nothing left marked in progress",
+              "no library file left open or locked", "no temporary files left behind",
+              "M3 model file loads and is the frozen model", "M3 scores a known input",
+              "M3 skips a track without measurements, explains why and keeps its rating",
+              "classic energy stays the default",
+          }
+          sys.stdout.reconfigure(errors="backslashreplace", line_buffering=True)
+          WINDOWS = sys.platform == "win32"
+          if WINDOWS:
+              # The self-test's library goes in OUTPUT_FOLDER/library, 8 characters longer: 193 is
+              # where backups first failed, and 238 is the longest library rekordbox itself can use.
+              app, long_paths = "dist/Rekordbox Organizer.exe", {"failed": 185, "longest": 230}
+          else:
+              app = "dist/Rekordbox Organizer.app/Contents/MacOS/Rekordbox Organizer"
+              # Well past any usual music folder, and within macOS's limit of 1024 bytes and SQLite's
+              # of 512. There's no 259-character limit here for this to catch.
+              long_paths = {"long": 300}
+          app = os.path.abspath(app)
+          base = tempfile.mkdtemp(prefix="selftest-", dir=os.environ["RUNNER_TEMP"])
+
+
+          def fresh_folder(name, length=0):
+              path = os.path.join(base, name)
+              while len(path) < length:
+                  room = length - len(path) - 1
+                  part = min(room, 60)
+                  path = os.path.join(path, "x" * (part - 1 if room - part == 1 else part))
+              os.makedirs(path)
+              if length and len(path) != length or os.listdir(path):
+                  sys.exit(f"::error::couldn't make a new empty folder of {length} characters: {path}")
+              return path
+
+
+          PROBE = """
+          import sys
+          open(sys.argv[1], "w").close()   # a normal path, so any other failure can't pass as the limit
+          try:
+              open(sys.argv[2], "w").close()
+          except FileNotFoundError:
+              sys.exit(3)
+          """
+
+
+          def new_process_can_pass_the_limit(name):
+              """Asks a new process, which is long-path aware like the app. None if it can't tell."""
+              folder = fresh_folder(name, 230)
+              code = subprocess.run([sys.executable, "-c", PROBE, os.path.join(folder, "normal"),
+                                     os.path.join(folder, "x" * 40)], stdin=subprocess.DEVNULL).returncode
+              return {0: True, 3: False}.get(code)
+
+
+          def enforce_the_windows_path_limit():
+              """The app is long-path aware and GitHub's Windows images turn long paths on, so these
+              runs would pass with or without the fix. Windows reads the setting once per process, so
+              new processes should see the change without a reboot; both probes prove it on this runner,
+              which is discarded afterwards."""
+              import winreg
+              key = r"SYSTEM\CurrentControlSet\Control\FileSystem"
+              with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key, 0, winreg.KEY_READ) as k:
+                  try:
+                      enabled = winreg.QueryValueEx(k, "LongPathsEnabled")[0]
+                  except FileNotFoundError:
+                      enabled = 0
+              print("LongPathsEnabled on this runner:", enabled)
+              if enabled:
+                  if new_process_can_pass_the_limit("probe-before") is not True:
+                      sys.exit("::error::With long paths on, the probe couldn't pass the limit, so it "
+                               "can't show whether turning them off works.")
+                  with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key, 0, winreg.KEY_SET_VALUE) as k:
+                      winreg.SetValueEx(k, "LongPathsEnabled", 0, winreg.REG_DWORD, 0)
+              if new_process_can_pass_the_limit("probe-after") is not False:
+                  sys.exit("::error::A new process wasn't refused a path past 259 characters, so these "
+                           "runs wouldn't test the long-path fix.")
+              print("Confirmed: a new process can't write a path past 259 characters.")
+
+
+          def problems_with(folder):
+              print(f"\n=== {len(folder)}-character folder: {folder}")
+              try:
+                  code = subprocess.run([app, "--selftest", folder], cwd=base, stdin=subprocess.DEVNULL,
+                                        timeout=600).returncode
+              except (OSError, subprocess.TimeoutExpired) as exc:
+                  return [f"the app didn't finish: {exc}"]
+              path = os.path.join(folder, "selftest.json")
+              if not os.path.exists(path):
+                  return [f"exit code {code} and no selftest.json"]
+              with open(path, encoding="utf-8") as f:
+                  report = json.load(f)
+              results = report["results"]
+              for r in results:
+                  print(("PASS " if r["ok"] is True else "FAIL ") + r["check"])
+                  if r["ok"] is not True:
+                      print("     " + r["detail"])
+              found = []
+              if code != 0:
+                  found.append(f"exit code {code}")
+              if report["frozen"] is not True or not os.path.samefile(report["executable"], app):
+                  found.append(f"this wasn't the packaged app: {report['executable']}")
+              if report["passed"] is not True:
+                  found.append("the report says it didn't pass")
+              found += [f"failed: {r['check']}" for r in results if r["ok"] is not True]
+              found += [f"missing: {name}" for name in sorted(EXPECTED - {r["check"] for r in results})]
+              return found
+
+
+          if not os.path.isfile(app):
+              sys.exit(f"::error::no packaged app at {app}")
+          if WINDOWS:
+              enforce_the_windows_path_limit()
+          folders = [fresh_folder("short")]
+          folders += [fresh_folder(name, length) for name, length in long_paths.items()]
+          bad = {folder: problems_with(folder) for folder in folders}
+          bad = {folder: found for folder, found in bad.items() if found}
+          for folder, found in bad.items():
+              for line in found:
+                  print(f"::error::{len(folder)}-character folder: {line}")
+          if bad:
+              sys.exit(1)
+          print(f"\nAll {len(EXPECTED)} named checks passed in all {len(folders)} folders.")
 
       - uses: actions/upload-artifact@v4
         with:
