@@ -86,6 +86,10 @@ hidden), so download the newest version once using the links above. Updating *fr
 Click OK and open the app again: it's already updated. Every later version restarts
 by itself.
 
+Updating *from* 1.3.2 or earlier can stop with "HTTP Error 504" when GitHub's download
+link is having trouble. Choose to open the download page, or try again later. From 1.3.3
+on, the app retries by itself.
+
 **Running from source?** Update with `git pull` in the app's folder, or download the
 ZIP again.
 
