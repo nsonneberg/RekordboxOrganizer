@@ -67,8 +67,12 @@ def open_database(path: Optional[str] = None):
         db.commit_started = True
         return session_commit(*args, **kwargs)
     db.commit = commit
-    if db.playlist_xml is not None:
-        _atomic_playlist_xml(db.playlist_xml)
+    try:
+        if db.playlist_xml is not None:
+            _atomic_playlist_xml(db.playlist_xml)
+    except BaseException:
+        db.close()
+        raise
     return db
 
 
@@ -409,8 +413,9 @@ def restore_backup(backup_path: str, db_path: str) -> str:
 
 
 def open_preview_copy(db) -> tuple[object, str]:
-    """A copy of the open library to read or try a run on: (database, temp folder).
+    """Swap the open library for a copy to read or try a run on: (database, temp folder).
 
+    Always closes db, even on failure, and a failed copy leaves no temp folder behind.
     Analysis files are still read from the real library's folder. Anything that only
     looks at the library should use this: if rekordbox crashed, saved changes wait in
     master.db-wal, and SQLite moves them into master.db when its last connection closes.
@@ -418,16 +423,27 @@ def open_preview_copy(db) -> tuple[object, str]:
     import pathlib
     import tempfile
 
-    src = database_path(db)
-    work = tempfile.mkdtemp(prefix="rbo-preview-")
-    for suffix in ("",) + JOURNALS:
-        if os.path.exists(src + suffix):
-            shutil.copy2(src + suffix, os.path.join(work, "master.db" + suffix))
-    xml = os.path.join(os.path.dirname(src), "masterPlaylists6.xml")
-    if os.path.exists(xml):
-        shutil.copy2(xml, work)
-    copy = open_database(os.path.join(work, "master.db"))
-    copy._share_dir = pathlib.Path(os.path.dirname(src)) / "share"
+    copy = work = None
+    try:
+        try:
+            src = database_path(db)
+            work = tempfile.mkdtemp(prefix="rbo-preview-")
+            for suffix in ("",) + JOURNALS:
+                if os.path.exists(src + suffix):
+                    shutil.copy2(src + suffix, os.path.join(work, "master.db" + suffix))
+            xml = os.path.join(os.path.dirname(src), "masterPlaylists6.xml")
+            if os.path.exists(xml):
+                shutil.copy2(xml, work)
+            copy = open_database(os.path.join(work, "master.db"))
+            copy._share_dir = pathlib.Path(os.path.dirname(src)) / "share"
+        finally:
+            db.close()
+    except BaseException:
+        if copy is not None:
+            copy.close()
+        if work:
+            shutil.rmtree(work, ignore_errors=True)
+        raise
     return copy, work
 
 
