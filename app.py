@@ -1127,7 +1127,8 @@ class App(ttk.Frame):
 
         def work():
             try:
-                updater.install(info["url"], lambda done, total: status.put(("progress", (done, total))))
+                updater.install(info, lambda done, total: status.put(("progress", (done, total))),
+                                lambda message: status.put(("message", message)))
                 status.put(("done", None))
             except Exception as exc:
                 status.put(("error", str(exc)))
@@ -1139,6 +1140,8 @@ class App(ttk.Frame):
                     if kind == "progress":
                         done, total = payload
                         self.progress.configure(maximum=max(total, done, 1), value=done)
+                    elif kind == "message":
+                        self.update_label.configure(text=payload)
                     elif kind == "done":
                         self.master.destroy()     # the new version is starting
                         return

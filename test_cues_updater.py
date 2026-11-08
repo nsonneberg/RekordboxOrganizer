@@ -1,3 +1,4 @@
+import hashlib
 import io
 import json
 import os
@@ -72,7 +73,8 @@ class _Resp(io.BytesIO):
 class UpdaterTests(unittest.TestCase):
     def release(self, tag):
         return {"tag_name": tag, "body": "New stuff", "html_url": "https://example/rel",
-                "assets": [{"name": name, "browser_download_url": "https://example/" + name}
+                "assets": [{"name": name, "browser_download_url": updater.DOWNLOAD_PREFIX + tag + "/" + name,
+                            "digest": "sha256:" + "0" * 64, "size": 1}
                            for name in updater.ASSETS.values()]}
 
     def check(self, tag, current):
@@ -104,7 +106,9 @@ class UpdaterTests(unittest.TestCase):
              mock.patch.object(updater, "_open", lambda url, timeout: _Resp(b"new version")), \
              mock.patch.object(updater.subprocess, "Popen") as started:
             seen = []
-            updater.install("https://example/x.exe", lambda d, t: seen.append((d, t)))
+            updater.install({"url": updater.DOWNLOAD_PREFIX + "x.exe", "size": 11,
+                             "sha256": hashlib.sha256(b"new version").hexdigest()},
+                            lambda d, t: seen.append((d, t)))
         with open(exe, "rb") as f:
             self.assertEqual(f.read(), b"new version")
         with open(exe + ".old", "rb") as f:
