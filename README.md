@@ -90,6 +90,14 @@ Updating *from* 1.3.2 or earlier can stop with "HTTP Error 504" when GitHub's do
 link is having trouble. Choose to open the download page, or try again later. From 1.3.3
 on, the app retries by itself.
 
+**Version 1.3.3 is a prerelease on all systems.** On Windows, Smart App Control or a
+similar Application Control policy may block it, so the app doesn't offer it as an update.
+If updating from 1.3.2 stopped with "[WinError 4551] An Application Control policy has
+blocked this file", don't click **Update now** again and don't delete
+`Rekordbox Organizer.exe.old`, which is your previous version. Download
+[stable v1.3.2](../../releases/tag/v1.3.2) into a new folder and use that until a signed
+build is available. The update doesn't touch your Rekordbox library.
+
 **Running from source?** Update with `git pull` in the app's folder, or download the
 ZIP again.
 
