@@ -1335,9 +1335,7 @@ def run(opt: Options, xml_path: Optional[str] = None, log: Callable[[str], None]
             rbdb.end_change(db_path)    # failed before saving anything: nothing to recover
         raise
     finally:
-        db.close()
-        if work:
-            shutil.rmtree(work, ignore_errors=True)
+        rbdb.close_preview_copy(db, work)
 
 
 def _refuse_if_interrupted(db) -> None:
@@ -1494,8 +1492,7 @@ def genre_review(xml_path: Optional[str] = None, log: Callable[[str], None] = pr
         try:
             tracks, _ = rbdb.load_tracks(db)
         finally:
-            db.close()
-            shutil.rmtree(work, ignore_errors=True)
+            rbdb.close_preview_copy(db, work)
     choices: dict[str, str] = {fam.casefold(): fam for fam, _ in genres.FAMILIES}
     for subs in genres.SUBGENRES.values():
         for sub in subs:
@@ -1572,6 +1569,4 @@ def save_genres(new: dict[str, str], log: Callable[[str], None] = print,
             rbdb.end_change(db_path)
         raise
     finally:
-        db.close()
-        if work:
-            shutil.rmtree(work, ignore_errors=True)
+        rbdb.close_preview_copy(db, work)

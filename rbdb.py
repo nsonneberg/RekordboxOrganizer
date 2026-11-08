@@ -439,12 +439,25 @@ def open_preview_copy(db) -> tuple[object, str]:
         finally:
             db.close()
     except BaseException:
-        if copy is not None:
-            copy.close()
-        if work:
-            shutil.rmtree(work, ignore_errors=True)
+        close_preview_copy(copy, work)
         raise
     return copy, work
+
+
+def close_preview_copy(db, work: Optional[str]) -> None:
+    """Close db, if there is one, and remove its temp folder even if closing fails."""
+    try:
+        if db is not None:
+            db.close()
+    finally:
+        if work:
+            if db is not None and db.session is not None:   # close failed: Windows can't delete an open file
+                try:
+                    db.session.invalidate()
+                    db.engine.dispose()
+                except Exception:
+                    pass
+            shutil.rmtree(work, ignore_errors=True)
 
 
 def write_changes(db, contents: dict, plan: Plan, folder_name: str,

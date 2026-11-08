@@ -401,6 +401,38 @@ class PreviewCopyCleanupTests(LeftoverJournalCase):
             self.before = self.files()
             self.fail_each_caller(contextlib.nullcontext, opened=2)
 
+    def closing_fails(self, only_the_copy=True, released=True):
+        """Make close() raise on the copy (or every handle), having let go of the file or not."""
+        import pyrekordbox
+        recording = pyrekordbox.MasterDatabase
+
+        def flaky(path=None):
+            db = recording(path)
+            if path or not only_the_copy:
+                close = db.close
+
+                def fail():
+                    if released:
+                        close()
+                    raise OSError("Couldn't close the database")
+                db.close = fail
+            return db
+        return mock.patch.object(pyrekordbox, "MasterDatabase", flaky)
+
+    def test_closing_the_copy_fails(self):
+        self.fail_each_caller(self.closing_fails, opened=2)
+
+    def test_closing_the_copy_fails_while_it_still_holds_the_file(self):
+        for name, call in self.callers.items():
+            with self.subTest(name), self.closing_fails(released=False):
+                with self.assertRaises(OSError):
+                    call()
+                self.assertEqual(os.listdir(self.temp), [])
+                self.assertEqual(self.files(), self.before)
+
+    def test_closing_both_handles_fails_during_the_swap(self):
+        self.fail_each_caller(lambda: self.closing_fails(only_the_copy=False), opened=2)
+
     def test_a_successful_review_closes_everything(self):
         self.callers["Review genres"]()
         self.assert_nothing_left(opened=2)
