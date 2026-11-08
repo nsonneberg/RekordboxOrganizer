@@ -7,9 +7,11 @@ playlists, genres and commits - is exercised without touching a real library.
 XML mode runs on a small sample export in a temporary folder.
 """
 
+import contextlib
 import hashlib
 import os
 import shutil
+import sqlite3
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
@@ -17,7 +19,7 @@ from unittest import mock
 
 import organizer
 import rbdb
-from selftest import make_master_db
+from selftest import PLAYLIST_XML, make_master_db
 from test_organizer import SAMPLE
 
 QUIET = dict(log=lambda m: None)
@@ -265,6 +267,190 @@ class DatabaseWriteTests(DatabaseCase):
             rows, _ = organizer.genre_review(opt=organizer.Options(), **QUIET)
         self.assertEqual(sorted(r.id for r in rows), ["2", "3"])
         self.assertEqual(self.backups(), [])
+
+
+class LeftoverJournalCase(DatabaseCase):
+    """A crashed rekordbox leaves saved changes in master.db-wal. SQLite moves them into
+    master.db when its last connection closes, so looking at a library must not connect to it."""
+
+    def setUp(self):
+        super().setUp()
+        con = sqlite3.connect(self.db)
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA wal_autocheckpoint=0")
+        con.execute("UPDATE djmdContent SET Title='From the journal' WHERE ID='2'")
+        con.commit()
+        crashed = os.path.join(self.dir, "crashed")
+        os.mkdir(crashed)
+        for suffix in ("", "-wal"):
+            shutil.copy2(self.db + suffix, os.path.join(crashed, "master.db" + suffix))
+        con.close()
+        self.db = os.path.join(crashed, "master.db")
+        self.before = self.files()
+
+    def files(self):
+        folder = os.path.dirname(self.db)
+        return {name: (sha(os.path.join(folder, name)),
+                       os.stat(os.path.join(folder, name)).st_mtime_ns)
+                for name in os.listdir(folder)}
+
+
+class LeftoverJournalTests(LeftoverJournalCase):
+    def test_genre_review_leaves_it_alone_and_still_sees_the_journal(self):
+        with mock.patch.object(organizer, "predict", return_value={}):
+            rows, _ = organizer.genre_review(opt=organizer.Options(), **QUIET)
+        self.assertEqual({r.id: r.name for r in rows}["2"], "From the journal")
+        self.assertEqual(self.files(), self.before)
+
+    def test_preview_leaves_it_alone(self):
+        organizer.run(by_bpm(), preview=True, changes=organizer.Changes(), **QUIET)
+        self.assertEqual(self.files(), self.before)
+
+    def test_finding_the_library_leaves_it_alone(self):
+        self.assertEqual(rbdb.library_path(), self.db)
+        self.assertEqual(self.files(), self.before)
+
+    def test_opening_the_app_leaves_it_alone(self):
+        import app
+        import tk_test_root
+        root = tk_test_root.open_root(self)
+        settings = os.path.join(self.dir, "settings.json")
+        with mock.patch.object(app, "settings_path", lambda: settings),                 mock.patch.object(app.App, "check_for_update", lambda _: None):
+            app.App(root)
+            root.update()
+        self.assertEqual(self.files(), self.before)
+
+
+class PreviewCopyCleanupTests(LeftoverJournalCase):
+    """A copy that fails partway, or rekordbox being open, leaves nothing behind."""
+
+    def setUp(self):
+        import pyrekordbox
+        super().setUp()
+        self.temp = os.path.join(self.dir, "temp")
+        os.mkdir(self.temp)
+        self.opened = []
+        make = pyrekordbox.MasterDatabase
+
+        def recording(path=None):
+            self.opened.append(make(path))
+            return self.opened[-1]
+        patches = [mock.patch.object(tempfile, "tempdir", self.temp),
+                   mock.patch.object(pyrekordbox, "MasterDatabase", recording),
+                   mock.patch.object(organizer, "predict", return_value={})]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        self.callers = {
+            "Review genres": lambda: organizer.genre_review(opt=organizer.Options(), **QUIET),
+            "Preview": lambda: organizer.run(by_bpm(), preview=True, changes=organizer.Changes(), **QUIET),
+            "Preview genres": lambda: organizer.save_genres({"2": "House"}, preview=True,
+                                                            changes=organizer.Changes(), **QUIET)}
+
+    def assert_nothing_left(self, opened):
+        self.assertEqual(len(self.opened), opened)
+        self.assertEqual([db for db in self.opened if db.session is not None], [])
+        self.assertEqual(os.listdir(self.temp), [])
+        self.assertEqual(self.files(), self.before)
+
+    def fail_each_caller(self, failure, opened):
+        for name, call in self.callers.items():
+            with self.subTest(name):
+                self.opened.clear()
+                with failure():
+                    with self.assertRaises((OSError, RuntimeError)):
+                        call()
+                self.assert_nothing_left(opened)
+
+    def test_failing_partway_through_the_copy(self):
+        real = shutil.copy2
+        copied = []
+
+        def full_disk(src, dst, **kwargs):
+            if copied:
+                copied.clear()
+                raise OSError("No space left on device")
+            copied.append(src)
+            return real(src, dst, **kwargs)
+        self.fail_each_caller(lambda: mock.patch.object(shutil, "copy2", full_disk), opened=1)
+
+    def test_failing_to_open_the_copy(self):
+        import pyrekordbox
+        recording = pyrekordbox.MasterDatabase
+
+        def unreadable(path=None):
+            if path:
+                raise RuntimeError("Couldn't open the copy")
+            return recording()
+        self.fail_each_caller(lambda: mock.patch.object(pyrekordbox, "MasterDatabase", unreadable),
+                              opened=1)
+
+    def test_failing_just_after_opening_the_copy(self):
+        real = rbdb._atomic_playlist_xml
+        calls = []
+
+        def second_fails(xml):
+            calls.append(xml)
+            if len(calls) % 2 == 0:
+                raise OSError("Couldn't prepare the copy")
+            return real(xml)
+        with mock.patch.object(rbdb, "_atomic_playlist_xml", second_fails):
+            with open(os.path.join(os.path.dirname(self.db), "masterPlaylists6.xml"), "w",
+                      encoding="utf-8") as f:
+                f.write(PLAYLIST_XML)
+            self.before = self.files()
+            self.fail_each_caller(contextlib.nullcontext, opened=2)
+
+    def closing_fails(self, only_the_copy=True, released=True):
+        """Make close() raise on the copy (or every handle), having let go of the file or not."""
+        import pyrekordbox
+        recording = pyrekordbox.MasterDatabase
+
+        def flaky(path=None):
+            db = recording(path)
+            if path or not only_the_copy:
+                close = db.close
+
+                def fail():
+                    if released:
+                        close()
+                    raise OSError("Couldn't close the database")
+                db.close = fail
+            return db
+        return mock.patch.object(pyrekordbox, "MasterDatabase", flaky)
+
+    def test_closing_the_copy_fails(self):
+        self.fail_each_caller(self.closing_fails, opened=2)
+
+    def test_closing_the_copy_fails_while_it_still_holds_the_file(self):
+        for name, call in self.callers.items():
+            with self.subTest(name), self.closing_fails(released=False):
+                with self.assertRaises(OSError):
+                    call()
+                self.assertEqual(os.listdir(self.temp), [])
+                self.assertEqual(self.files(), self.before)
+
+    def test_closing_both_handles_fails_during_the_swap(self):
+        self.fail_each_caller(lambda: self.closing_fails(only_the_copy=False), opened=2)
+
+    def test_a_successful_review_closes_everything(self):
+        self.callers["Review genres"]()
+        self.assert_nothing_left(opened=2)
+
+    def test_review_genres_stops_before_touching_a_running_library(self):
+        self.running = True
+        with self.assertRaisesRegex(ValueError, "rekordbox is open.*close it.*Review genres"):
+            self.callers["Review genres"]()
+        self.assert_nothing_left(opened=0)
+
+    def test_review_genres_of_an_xml_export_works_while_rekordbox_is_open(self):
+        self.running = True
+        xml = os.path.join(self.temp, "export.xml")
+        with open(xml, "w", encoding="utf-8") as f:
+            f.write(SAMPLE)
+        organizer.genre_review(xml, opt=organizer.Options(), **QUIET)
+        self.assertEqual(self.opened, [])
+        self.assertEqual(self.files(), self.before)
 
 
 class BackupFailureTests(unittest.TestCase):

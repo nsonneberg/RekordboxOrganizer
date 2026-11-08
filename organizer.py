@@ -1300,8 +1300,7 @@ def run(opt: Options, xml_path: Optional[str] = None, log: Callable[[str], None]
     work = None
     started = False
     if preview:
-        real, (db, work) = db, rbdb.open_preview_copy(db)
-        real.close()
+        db, work = rbdb.open_preview_copy(db)
     try:
         db_path = rbdb.database_path(db)
         tracks, contents = rbdb.load_tracks(db)
@@ -1336,9 +1335,7 @@ def run(opt: Options, xml_path: Optional[str] = None, log: Callable[[str], None]
             rbdb.end_change(db_path)    # failed before saving anything: nothing to recover
         raise
     finally:
-        db.close()
-        if work:
-            shutil.rmtree(work, ignore_errors=True)
+        rbdb.close_preview_copy(db, work)
 
 
 def _refuse_if_interrupted(db) -> None:
@@ -1487,11 +1484,15 @@ def genre_review(xml_path: Optional[str] = None, log: Callable[[str], None] = pr
         _, tracks = load_library(xml_path)
     else:
         import rbdb
-        db = rbdb.open_database()
+        # The copy needs a still library: rekordbox could be writing to it while it's copied.
+        if rbdb.rekordbox_running():
+            raise ValueError("rekordbox is open. Please close it first, then press Review genres again.")
+        # On a copy: closing a connection to the real file can change it (see open_preview_copy).
+        db, work = rbdb.open_preview_copy(rbdb.open_database())
         try:
             tracks, _ = rbdb.load_tracks(db)
         finally:
-            db.close()
+            rbdb.close_preview_copy(db, work)
     choices: dict[str, str] = {fam.casefold(): fam for fam, _ in genres.FAMILIES}
     for subs in genres.SUBGENRES.values():
         for sub in subs:
@@ -1541,8 +1542,7 @@ def save_genres(new: dict[str, str], log: Callable[[str], None] = print,
     work = None
     started = False
     if preview:
-        real, (db, work) = db, rbdb.open_preview_copy(db)
-        real.close()
+        db, work = rbdb.open_preview_copy(db)
     try:
         _, contents = rbdb.load_tracks(db)
         original = {tid: (contents[tid].GenreName or "").strip() if tid in contents else ""
@@ -1569,6 +1569,4 @@ def save_genres(new: dict[str, str], log: Callable[[str], None] = print,
             rbdb.end_change(db_path)
         raise
     finally:
-        db.close()
-        if work:
-            shutil.rmtree(work, ignore_errors=True)
+        rbdb.close_preview_copy(db, work)
