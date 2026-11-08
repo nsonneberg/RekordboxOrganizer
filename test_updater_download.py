@@ -22,6 +22,7 @@ import app
 import updater
 
 REAL_RUN = subprocess.run
+REAL_POPEN = subprocess.Popen
 PAYLOAD = b"the new version " * 2000
 OK = (200, {}, PAYLOAD)
 
@@ -581,7 +582,8 @@ class MacHandoffTests(unittest.TestCase):
         def real_ditto(command, **kwargs):
             return REAL_RUN(command, **kwargs) if command[0] == "ditto" else self.fake_run(command, **kwargs)
         self.run_commands.side_effect = real_ditto
-        self.install()
+        with mock.patch.object(updater.subprocess, "Popen", REAL_POPEN):
+            self.install()
         self.assertEqual(self.running_program(), "new")
 
 
