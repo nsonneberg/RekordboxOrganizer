@@ -1286,7 +1286,8 @@ def run(opt: Options, xml_path: Optional[str] = None, log: Callable[[str], None]
     With xml_path, reads that export and writes a new XML next to it; returns its path.
     Without, works directly on rekordbox's database; returns the database path.
     preview: do everything on a throwaway copy and save nothing; fill `changes`
-    to see what a real run would do. Works while rekordbox is open.
+    to see what a real run would do. Straight from rekordbox, rekordbox must be
+    closed for a preview too: the copy has to be of a library nothing is writing to.
     """
     folder_name = opt.folder_name.strip() or "Organized"
     opt = dataclasses.replace(opt, **{name: False for name in NOT_YET})
@@ -1332,8 +1333,11 @@ def run(opt: Options, xml_path: Optional[str] = None, log: Callable[[str], None]
         return out_path
 
     import rbdb
-    if not preview and rbdb.rekordbox_running():
-        raise ValueError("rekordbox is open. Please close it first, then press Run again.")
+    # A preview only reads a copy, which is checked for changes made while copying, so
+    # only rekordbox itself must be closed; a run writes, so its helper must be too.
+    if rbdb.rekordbox_app_running() if preview else rbdb.rekordbox_running():
+        raise ValueError(rbdb.open_message("press " + ("Preview" if preview else "Run")
+                                           + " again", reading=preview))
     log("Opening your rekordbox library ...")
     db = rbdb.open_database()
     if not preview:
@@ -1355,8 +1359,8 @@ def run(opt: Options, xml_path: Optional[str] = None, log: Callable[[str], None]
 
         if not preview:
             if rbdb.rekordbox_running():
-                raise ValueError("rekordbox was opened while working. Nothing was changed - "
-                                 "close rekordbox and press Run again.")
+                raise ValueError(f"{rbdb.who_started()} while working. Nothing was changed - "
+                                 "close it and press Run again.")
             started = _begin_write(db_path, log)
         rbdb.add_hot_cues(db, contents, hot_cues, log, changes,   # saved with the rest
                           colours=opt.cue_colours)
@@ -1526,8 +1530,8 @@ def genre_review(xml_path: Optional[str] = None, log: Callable[[str], None] = pr
     else:
         import rbdb
         # The copy needs a still library: rekordbox could be writing to it while it's copied.
-        if rbdb.rekordbox_running():
-            raise ValueError("rekordbox is open. Please close it first, then press Review genres again.")
+        if rbdb.rekordbox_app_running():
+            raise ValueError(rbdb.open_message("press Review genres again", reading=True))
         # On a copy: closing a connection to the real file can change it (see open_preview_copy).
         db, work = rbdb.open_preview_copy(rbdb.open_database())
         try:
@@ -1574,8 +1578,8 @@ def save_genres(new: dict[str, str], log: Callable[[str], None] = print,
     songs in `new` are changed; every other tag is left exactly as it is.
     """
     import rbdb
-    if not preview and rbdb.rekordbox_running():
-        raise ValueError("rekordbox is open. Please close it first, then save again.")
+    if rbdb.rekordbox_app_running() if preview else rbdb.rekordbox_running():
+        raise ValueError(rbdb.open_message("save again", reading=preview))
     db = rbdb.open_database()
     db_path = rbdb.database_path(db)
     if not preview:
