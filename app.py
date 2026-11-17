@@ -1264,18 +1264,44 @@ class App(ttk.Frame):
                               "playlists and tags look right. Keep the library as it is?",
                     parent=win):
                 return
-            rbdb.end_change(db_path)
+            try:
+                rbdb.keep_library_as_is(db_path)     # refuses for an Undo that stopped
+            except OSError as exc:
+                messagebox.showerror(APP_NAME, str(exc), parent=win)
+                return
             win.destroy()
             self.log("Kept your library as it is; saving is allowed again.")
 
-        if interrupted is not None:
+        def put_back():
+            if rbdb.rekordbox_running():
+                messagebox.showwarning(APP_NAME, rbdb.open_message("press it again"),
+                                       parent=win)
+                return
+            try:
+                done = rbdb.put_right_stopped_undo(db_path)
+            except OSError as exc:
+                messagebox.showerror(APP_NAME, f"Couldn't put your library back:\n{exc}",
+                                     parent=win)
+                return
+            win.destroy()
+            self.log(done)
+            messagebox.showinfo(APP_NAME, done)
+
+        # An Undo that stopped part-way is put right, never just kept: its marker holds
+        # the plan that does that (see rbdb.keep_as_is_allowed).
+        if interrupted is not None and interrupted.get("what") == "undo" \
+                and isinstance(interrupted.get("plan"), dict):
+            ttk.Button(buttons, text="Put my library back",
+                       command=put_back).pack(side="left", padx=(8, 0))
+        elif interrupted is not None and rbdb.keep_as_is_allowed(interrupted, db_path):
             ttk.Button(buttons, text="Keep my library as it is",
                        command=keep_as_is).pack(side="left", padx=(8, 0))
 
         def restore():
             chosen = backups[box.curselection()[0]] if box.curselection() else backups[0]
             if rbdb.rekordbox_running():
-                messagebox.showwarning(APP_NAME, "Please close rekordbox first.", parent=win)
+                messagebox.showwarning(APP_NAME, rbdb.open_message("press Restore again"),
+                                       parent=win)
                 return
             try:
                 keep = rbdb.restore_backup(chosen, db_path)

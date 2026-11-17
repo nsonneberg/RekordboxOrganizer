@@ -129,6 +129,7 @@ def run(out: str, audio_dir: str = "") -> int:
     real = pyrekordbox.MasterDatabase
     pyrekordbox.MasterDatabase = lambda path=None: real(path or db, unlock=False)
     rbdb.rekordbox_running = lambda: False
+    rbdb.running_writers = lambda: []       # nor its helper (Preview checks for rekordbox only)
     pdb.get_rekordbox_pid = lambda: 0
     log = log_lines.append
     opt = organizer.Options(bpm=True, bpm_step=5, guess_genres=False)

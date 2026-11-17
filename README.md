@@ -478,19 +478,38 @@ consistent with earlier runs.
 1. Open Rekordbox Organizer and tick what you want on each tab (Library, My
    playlists, Extra playlists, Energy, Cues, Genres, Set builder). The line next to
    the Run button sums up what's ticked.
-2. Press **Preview** to see exactly what would change: songs moved, playlists created
-   or added to, star ratings and hot cues. Nothing is changed, and rekordbox can stay open.
-3. **Close rekordbox** and press **Run** (or **Run now** in the preview).
+2. **Close rekordbox** and press **Preview** to see exactly what would change: songs
+   moved, playlists created or added to, star ratings and hot cues. Nothing is changed.
+3. Press **Run** (or **Run now** in the preview).
 4. Open rekordbox. The new folder is in your playlists, and ratings are updated.
 
 The app reads and writes rekordbox's own library database (rekordbox 6 and 7).
+Preview, Review genres and backups work on copies of it, so rekordbox has to be closed
+for those too: a copy of a library rekordbox is saving to can mix two moments. If the
+library changes while the app is copying it anyway, the app stops, throws the copy
+away and says so; nothing in your library is changed. Run, saving genres and Undo also
+wait for rekordbox's background helper, `rekordboxAgent`, to be quit (in Activity
+Monitor on a Mac, or Task Manager on Windows), since it can change the library too.
 Before changing anything it saves a backup next to the library, named
 `master.organizer-backup-<date>.db`. It keeps the 3 most recent backups.
 
 **Undo:** close rekordbox, press **Undo last run...**, pick the run, and press
 **Restore**. Your library goes back to how it was just before that run. Anything you
 changed in rekordbox after it is undone too. Your library as it was before the undo is
-saved as `master.before-undo-<date>.db`, so you can change your mind. The library is in
+saved as `master.before-undo-<date>.db`, so you can change your mind. If anything
+touches your library while Undo is swapping the files (rekordbox opening, say), Undo
+stops and puts your library back as it is, so no change is lost; if rekordbox is open
+by then, Undo moves nothing more, and pressing Undo again once it's closed puts your
+library back first. An Undo cut off part-way (a crash) is finished or undone by **Put my
+library back** in the Undo window (or by the next Undo). Any file kept because it may
+hold something saved during an Undo is named in full, and the app never deletes it. A
+saved copy that changed after it was made is never tidied away.
+
+On a Mac, a program can keep using a file after it's been renamed, and SQLite deletes
+the library's `master.db-wal` by name when it closes. So, before and after swapping the
+files, Undo asks macOS (`lsof`) whether any program, not only rekordbox, has the library
+open, and stops (or puts the library back) if one does, or if it can't tell. It can't
+see programs run by another user or by the system. The library is in
 `%APPDATA%\Pioneer\rekordbox\` on Windows and `~/Library/Pioneer/rekordbox/` on macOS.
 
 Every backup (and every restore) is checked byte for byte against what it copied, and is
@@ -503,9 +522,10 @@ they are saved one after the other, so an interrupted save can leave them out of
 The app notes each change in `master.organizer-pending.json` (next to the library) before
 writing and removes it once both files are saved. If it finds that note, it says so and
 won't write anything else until you either press **Undo last run...** and restore the
-backup it names (the safe choice; an interrupted Undo can simply be run again), or check
-your library in rekordbox and choose **Keep my library as it is**. Nothing is restored
-automatically. To recover by hand instead: close rekordbox, copy the whole folder
+backup it names (the safe choice), or check your library in rekordbox and choose **Keep
+my library as it is**. An Undo that was cut off is never just kept: the Undo window
+offers **Put my library back** instead (or **Restore**, which does that first). Nothing
+is restored automatically. To recover by hand instead: close rekordbox, copy the whole folder
 somewhere safe first, then copy `master.organizer-backup-<date>.db` over `master.db`,
 `master.organizer-backup-<date>.masterPlaylists6.xml` over `masterPlaylists6.xml`, delete
 any `master.db-wal` / `master.db-shm` next to `master.db` (put back the backup's own ones

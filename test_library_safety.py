@@ -53,6 +53,8 @@ class DatabaseCase(unittest.TestCase):
         self.running = False
         patches = [mock.patch.object(pyrekordbox, "MasterDatabase", master_database),
                    mock.patch.object(rbdb, "rekordbox_running", lambda: self.running),
+                   mock.patch.object(rbdb, "running_writers",
+                                     lambda: ["rekordbox"] if self.running else []),
                    mock.patch("pyrekordbox.masterdb.database.get_rekordbox_pid",
                               lambda: 1234 if self.running else 0)]
         for p in patches:
@@ -100,10 +102,17 @@ class DatabasePreviewTests(DatabaseCase):
             self.assertEqual(getattr(preview, field), getattr(real, field), field)
         self.assertNotEqual(self.state(), before)
 
-    def test_preview_works_while_rekordbox_is_open(self):
+    def test_preview_refuses_while_rekordbox_is_open(self):
+        # The preview reads a copy, and a copy of a library rekordbox is writing to can be
+        # a mix of two moments ("database disk image is malformed"); see test_library_copy.
         self.running = True
         digest = sha(self.db)
-        organizer.run(by_bpm(), preview=True, changes=organizer.Changes(), **QUIET)
+        with mock.patch.object(rbdb, "open_preview_copy", side_effect=AssertionError("copied")):
+            with self.assertRaisesRegex(ValueError, "rekordbox is open.*Preview again"):
+                organizer.run(by_bpm(), preview=True, changes=organizer.Changes(), **QUIET)
+            with self.assertRaisesRegex(ValueError, "rekordbox is open"):
+                organizer.save_genres({"2": "House"}, preview=True, changes=organizer.Changes(),
+                                      **QUIET)
         self.assertEqual(sha(self.db), digest)
 
     def test_genre_save_preview_changes_nothing(self):
@@ -363,16 +372,16 @@ class PreviewCopyCleanupTests(LeftoverJournalCase):
                 self.assert_nothing_left(opened)
 
     def test_failing_partway_through_the_copy(self):
-        real = shutil.copy2
+        real = rbdb._copy_hashed
         copied = []
 
-        def full_disk(src, dst, **kwargs):
+        def full_disk(src, dst):
             if copied:
                 copied.clear()
                 raise OSError("No space left on device")
             copied.append(src)
-            return real(src, dst, **kwargs)
-        self.fail_each_caller(lambda: mock.patch.object(shutil, "copy2", full_disk), opened=1)
+            return real(src, dst)
+        self.fail_each_caller(lambda: mock.patch.object(rbdb, "_copy_hashed", full_disk), opened=1)
 
     def test_failing_to_open_the_copy(self):
         import pyrekordbox
@@ -503,22 +512,61 @@ class BackupFailureTests(unittest.TestCase):
         self.assertEqual(self.read("master.db-wal"), "journal")   # its own journal kept
         self.assertFalse([n for n in os.listdir(self.dir) if n.endswith(".restoring")])
 
-    def test_restore_when_the_file_cant_be_renamed_over(self):
+    def test_restore_stops_when_the_library_cant_be_replaced(self):
+        # Windows won't rename over a file another program (rekordbox, say) holds open.
+        # Writing over it in place instead could lose what that program saves next, so
+        # Undo stops and puts everything back.
         saved = rbdb.backup(self.db)
         with open(self.db, "w") as f:
             f.write("changed")
         real = os.replace
-        live = {self.db, self.db + "-wal", self.db + "-shm"}
 
         def held_open(src, dst):
-            if dst in live:                  # only the library itself is held open
+            if dst == self.db:
                 raise PermissionError("in use")
             return real(src, dst)
         with mock.patch.object(os, "replace", held_open):
-            rbdb.restore_backup(saved, self.db)
-        self.assertEqual(self.read("master.db"), "library")
+            with self.assertRaisesRegex(rbdb.LibraryChanged, "put back.*nothing was lost"):
+                rbdb.restore_backup(saved, self.db)
+        self.assertEqual(self.read("master.db"), "changed")
         self.assertEqual(self.read("master.db-wal"), "journal")
-        self.assertFalse([n for n in os.listdir(self.dir) if n.endswith(".restoring")])
+        self.assertFalse([n for n in os.listdir(self.dir)
+                          if n.endswith((".old", ".new", ".restored", ".found"))])
+        self.assertIsNone(rbdb.interrupted_change(self.db))
+        self.assertEqual(rbdb.list_backups(self.dir), [saved])
+
+    def test_restore_that_cant_put_things_back_deletes_nothing_and_says_so(self):
+        saved = rbdb.backup(self.db)
+        with open(self.db, "w") as f:
+            f.write("changed")
+        real_replace, real_link = os.replace, os.link
+        wal = self.db + "-wal"
+
+        def held_open(src, dst):
+            if dst == self.db:
+                raise PermissionError("in use")
+            return real_replace(src, dst)
+
+        def no_link_to_the_log(src, dst, **kw):
+            if dst == wal:
+                raise PermissionError("in use")
+            return real_link(src, dst, **kw)
+        with mock.patch.object(os, "replace", held_open), \
+                mock.patch.object(os, "link", no_link_to_the_log):
+            with self.assertRaisesRegex(OSError, "couldn't put your library back yet.*Nothing "
+                                                 "has been deleted.*press Undo again") as ctx:
+                rbdb.restore_backup(saved, self.db)
+        self.assertNotIsInstance(ctx.exception, rbdb.LibraryChanged)
+        self.assertEqual(rbdb.interrupted_change(self.db)["what"], "undo")
+        # The library as it was is still on disk (its own files and the checked copy).
+        names = os.listdir(self.dir)
+        self.assertEqual(self.read("master.db"), "changed")
+        self.assertEqual(sorted(self.read(n) for n in names if n.endswith("-wal.old")), ["journal"])
+        keep = [n for n in names if n.startswith("master.before-undo") and n.endswith(".db")]
+        self.assertEqual([self.read(n) for n in keep], ["changed"])
+        rbdb.restore_backup(saved, self.db)          # Undo again finishes it
+        self.assertEqual((self.read("master.db"), self.read("master.db-wal")),
+                         ("library", "journal"))
         self.assertIsNone(rbdb.interrupted_change(self.db))
 
     def test_backups_made_in_the_same_second_keep_their_order(self):
