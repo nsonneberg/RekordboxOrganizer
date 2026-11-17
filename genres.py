@@ -107,6 +107,7 @@ SUBGENRES: dict = {}        # family -> [subgenres]
 TYPICAL_BPM: dict = {}      # family -> (low, high)
 AUDIOSET_FAMILY: dict = {}  # AudioSet class -> family
 _SYNONYMS: dict = {}        # squashed name -> (family, subgenre)
+_FAMILY_ALIASES: dict = {}  # squashed alias -> family ("dnb" -> "Drum & Bass")
 _LABEL_CACHE: dict = {}
 
 
@@ -129,6 +130,10 @@ def refresh_taxonomy(reload: bool = False) -> None:
         for sub, synonyms in spec["subgenres"].items():
             for text in [sub] + list(synonyms):
                 _SYNONYMS.setdefault(_squash(_norm_genre(text)), (name, sub))
+    _FAMILY_ALIASES.clear()
+    for name, spec in tax["families"].items():
+        for alias in spec.get("aliases") or []:
+            _FAMILY_ALIASES.setdefault(_squash(_norm_genre(alias)), name)
     _LABEL_CACHE.clear()
 
 
@@ -1485,4 +1490,97 @@ def auto_genre_plan(tracks: list[Track], guesses: dict[str, str],
             everything = sorted((t for n in names for t in subs[n]), key=order)
             lists.insert(0, (f"All {family}", [t.id for t in everything]))
         plan.append(((AUTO_FOLDER, family), lists))
+    return plan
+
+
+# --------------------------------------------------------------------------- #
+# Popular genre playlists
+# --------------------------------------------------------------------------- #
+
+POPULAR_FOLDER = "Popular Genres"
+POPULAR_MORE_THAN = 25      # a genre needs more than this many songs (26+) for a playlist
+
+
+def popular_genre_key(tag: str) -> Optional[tuple[str, str, str, str]]:
+    """(family key, family name, genre key, genre name) for a Genre tag; None if it's vague.
+
+    The genre key is "" when the tag names the family itself ("House", or an
+    alias such as "DnB"); otherwise it's the genre within the family: a known subgenre in its
+    standard spelling ("tech-house" -> "Tech House"), or the tag's own name
+    ("Melodic House & Techno"). Keys ignore case, spacing and punctuation, so
+    every spelling of a genre counts as one. A tag that fits no family keeps
+    its own name as the family.
+
+    Underscores count as spaces here ("Tech_House" is Tech House). That's for
+    this feature only: the shared _norm_genre, used by every other genre
+    match, keeps them as they are.
+
+    The whole tag is one genre, as it is everywhere else in the app:
+    rekordbox stores a single genre per track, so "House, Techno" is one
+    genre with that name, not two.
+    """
+    tag = tag.replace("_", " ")
+    norm = _norm_genre(tag)
+    if not norm or norm in VAGUE_TAGS:
+        return None
+    alias = _FAMILY_ALIASES.get(_squash(norm))
+    if alias:
+        return alias, alias, "", ""
+    family, sub = subgenre_of(tag)
+    key = family if known_family(family) else _squash(_norm_genre(family))
+    if _squash(norm) == _squash(_norm_genre(family)):
+        sub = ""                            # the family's own name ("HipHop", "Hip-Hop")
+    elif not sub:
+        # A word for the family that isn't its name ("Disco" in Disco & Funk,
+        # "Afrobeats" in Afro): its own playlist, so "Disco & Funk" never holds
+        # only Disco, nor collects every song of the family.
+        sub = " ".join(tag.split())
+    if not sub:
+        return key, family, "", ""
+    return key, family, _squash(_norm_genre(sub)), sub
+
+
+def popular_genre_plan(tracks: list[Track], more_than: int = POPULAR_MORE_THAN):
+    """A playlist for every genre tag shared by more than `more_than` songs.
+
+    Only the songs' own Genre tags count (nothing is guessed or looked up).
+    Each genre gets its own playlist inside a folder for its family: a "House"
+    playlist holds songs tagged plain House, while Tech House, Afro House...
+    get their own playlists when they qualify. Vague tags ("Electronic",
+    "Dance & EDM") and genres with too few songs are left out.
+    Returns plan entries [((POPULAR_FOLDER, family), [(playlist, [ids])])].
+    """
+    members: dict[tuple[str, str], list[Track]] = defaultdict(list)
+    family_names: dict[str, Counter] = defaultdict(Counter)
+    genre_names: dict[tuple[str, str], Counter] = defaultdict(Counter)
+    for t in tracks:
+        hit = popular_genre_key(t.genre)
+        if hit is None:
+            continue
+        family_key, family, genre_key, genre = hit
+        members[(family_key, genre_key)].append(t)
+        family_names[family_key][family] += 1
+        if genre_key:
+            genre_names[(family_key, genre_key)][genre] += 1
+
+    def spelling(counts: Counter) -> str:
+        """The most used spelling (ties: alphabetical), so the name doesn't depend on order."""
+        return min(counts, key=lambda name: (-counts[name], name.casefold(), name))
+
+    def order(t: Track):
+        return (t.bpm, t.artist.casefold(), t.name.casefold())
+
+    folders: dict[str, list] = defaultdict(list)
+    for (family_key, genre_key), songs in members.items():
+        if len(songs) <= more_than:
+            continue
+        family = spelling(family_names[family_key])
+        name = spelling(genre_names[(family_key, genre_key)]) if genre_key else family
+        ids = [t.id for t in sorted(songs, key=order)]
+        folders[family_key].append((bool(genre_key), name.casefold(), name, ids))
+
+    plan = []
+    for family_key in sorted(folders, key=lambda k: spelling(family_names[k]).casefold()):
+        lists = [(name, ids) for _, _, name, ids in sorted(folders[family_key])]
+        plan.append(((POPULAR_FOLDER, spelling(family_names[family_key])), lists))
     return plan

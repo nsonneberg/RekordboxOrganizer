@@ -140,7 +140,7 @@ class App(ttk.Frame):
             "move_mismatched",
             "energy", "energy_experimental", "energy_relative", "energy_m3", "energy_ratings", "keep_ratings", "energy_tags",
             "phrase_cues", "cue_colours", "memory_cues", "set_build",
-            "genre", "bpm", "key", "artist", "label", "year", "rating", "colour",
+            "genre", "popular_genres", "bpm", "key", "artist", "label", "year", "rating", "colour",
             "date_added", "duplicates", "missing_files", "missing_info", "never_played")}
         # Other settings, saved as they are: {Options field: Tk variable}
         self.values = {
@@ -350,16 +350,19 @@ class App(ttk.Frame):
         ttk.Spinbox(min_row, from_=1, to=50, width=3,
                     textvariable=self.values["min_tracks"]).pack(side="left", padx=4)
         ttk.Label(min_row, text="tracks").pack(side="left")
-        ttk.Label(tab, text="Cleanup:", font=("", 9, "bold")).grid(row=5, column=0, sticky="w",
+        self._check(tab, "popular_genres",
+                    f"Popular genres: a playlist per genre with more than "
+                    f"{organizer.POPULAR_MORE_THAN} tracks (from Genre tags)", 5, 0, columnspan=2)
+        ttk.Label(tab, text="Cleanup:", font=("", 9, "bold")).grid(row=6, column=0, sticky="w",
                                                                   pady=(10, 0))
-        self._check(tab, "duplicates", "Duplicates (and which copies to remove)", 6, 0)
-        self._check(tab, "missing_files", "Missing files", 6, 1)
-        self._check(tab, "missing_info", "Missing genre / key / BPM", 7, 0)
-        self._check(tab, "never_played", "Never played", 7, 1)
+        self._check(tab, "duplicates", "Duplicates (and which copies to remove)", 7, 0)
+        self._check(tab, "missing_files", "Missing files", 7, 1)
+        self._check(tab, "missing_info", "Missing genre / key / BPM", 8, 0)
+        self._check(tab, "never_played", "Never played", 8, 1)
         self._hint(tab, f"'{organizer.EXTRA_COPIES_NAME}' lists the copies you can remove: for "
                         "each song the playable copy with the most cues and plays is kept. In "
                         "rekordbox, select them and choose 'Remove from Collection'. The app "
-                        "never deletes anything.", 8, columnspan=2)
+                        "never deletes anything.", 9, columnspan=2)
 
     def _tab_energy(self, tab):
         self._check(tab, "energy", "Rate each song's energy 1-5", 0)
@@ -544,7 +547,7 @@ class App(ttk.Frame):
         doing = []
         if v["custom_enabled"]:
             doing.append("my playlists")
-        extras = ("genre", "bpm", "key", "artist", "label", "year", "rating", "colour",
+        extras = ("genre", "popular_genres", "bpm", "key", "artist", "label", "year", "rating", "colour",
                   "date_added", "duplicates", "missing_files", "missing_info", "never_played")
         if any(v[k] for k in extras) or v["auto_genres"]:
             doing.append("extra playlists")
@@ -805,6 +808,8 @@ class App(ttk.Frame):
                     self.queue.put(("preview", changes))
                 else:
                     self.queue.put(("done", (out, opt.folder_name, xml_path is not None)))
+            except organizer.NoQualifyingGenres as exc:   # a result: nothing was written
+                self.queue.put(("nothing", str(exc)))
             except Exception as exc:  # report anything to the user rather than crash
                 self.queue.put(("error", str(exc)))
 
@@ -839,6 +844,12 @@ class App(ttk.Frame):
                     self.log("")
                     self.log(message)
                     messagebox.showinfo(APP_NAME, "Done!\n\n" + message)
+                    return
+                elif kind == "nothing":
+                    self.finish()             # not a run: "since last run" stays as it was
+                    self.log("")
+                    self.log(payload)
+                    messagebox.showinfo(APP_NAME, payload)
                     return
                 elif kind == "error":
                     self.finish()

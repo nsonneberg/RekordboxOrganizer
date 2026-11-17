@@ -123,6 +123,7 @@ class Options:
     set_bpm: str = ""
     # Automatic playlists: all off unless asked for.
     genre: bool = False
+    popular_genres: bool = False  # a playlist per genre tag with more than 25 tracks
     bpm: bool = False
     bpm_step: int = 5
     key: bool = False
@@ -660,6 +661,10 @@ def build_plan(tracks: list[Track], opt: Options, rules: Optional[list[_Rule]] =
     if opt.genre:
         plan.append(("By Genre", _group(
             tracks, lambda t: _text_key(t.genre, "No Genre"), case_insensitive=True)))
+
+    if opt.popular_genres:
+        import genres
+        plan.extend(genres.popular_genre_plan(tracks))   # Genre tags only, never guesses
 
     if opt.bpm:
         step = max(1, int(opt.bpm_step))
@@ -1201,13 +1206,22 @@ def _organize(tracks: list[Track], opt: Options, log: Callable[[str], None],
         log(setbuilder.describe(chain, req))
         if chain:
             plan.append((SETS_FOLDER, [(req.name, [t.id for t in chain])]))
-    if (not plan and not ratings and not opt.phrase_cues and not opt.memory_cues
-            and not (opt.energy and opt.energy_tags)):
+    nothing = (not plan and not ratings and not opt.phrase_cues and not opt.memory_cues
+               and not (opt.energy and opt.energy_tags))
+    if opt.popular_genres and not nothing:
+        log_popular_genres(plan, log)
+    if nothing:
+        if opt.popular_genres:      # ticked, but no genre is big enough: a result, not a mistake
+            raise NoQualifyingGenres(
+                f"No genres meet the threshold: none has more than {POPULAR_MORE_THAN} tracks, "
+                "so there are no popular-genre playlists to make. Nothing was changed.")
         raise ValueError("Nothing to do - tick at least one option.")
 
     shown_parents = set()
     for folder, lists in plan:
         path = folder_path(folder)
+        if path[:1] == (POPULAR_FOLDER,):
+            continue        # listed genre by genre in log_popular_genres
         if path == ():
             placed = sum(len(ids) for name, ids in lists if name != LEFTOVERS_NAME)
             used = sum(1 for name, ids in lists if name != LEFTOVERS_NAME
@@ -1229,6 +1243,33 @@ def _organize(tracks: list[Track], opt: Options, log: Callable[[str], None],
         else:
             log(f"  {path[0]}: {len(lists)} playlist{'s' if len(lists) != 1 else ''}")
     return plan, ratings, tracks
+
+
+POPULAR_FOLDER = "Popular Genres"     # genres.POPULAR_FOLDER, without importing genres
+POPULAR_MORE_THAN = 25                # genres.POPULAR_MORE_THAN
+
+
+class NoQualifyingGenres(ValueError):
+    """Popular genres was the only thing to do and no genre is big enough.
+
+    Raised while planning, before anything is backed up or written, so the
+    library and any XML output are left exactly as they were.
+    """
+
+
+def log_popular_genres(plan: Plan, log: Callable[[str], None]) -> None:
+    """List the popular-genre playlists a run will make, with their song counts."""
+    found = [(path[1], name, len(ids)) for folder, lists in plan
+             for path in [folder_path(folder)] if path[:1] == (POPULAR_FOLDER,)
+             for name, ids in lists]
+    if not found:
+        log(f"Popular genres: no genre has more than {POPULAR_MORE_THAN} tracks, "
+            "so no popular-genre playlists will be made.")
+        return
+    log(f"Popular genres (genres with more than {POPULAR_MORE_THAN} tracks), "
+        f"in '{POPULAR_FOLDER}':")
+    for family, name, count in found:
+        log(f"    {family} / {name}: {count} tracks")
 
 
 def _evictor(plan: Plan, opt: Options, chosen: list[Track]) -> Evictor:
