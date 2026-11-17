@@ -249,6 +249,30 @@ Organized
    └─ Unknown Genre            ← no tag and nothing to guess from
 ```
 
+**Popular genres:** (Extra playlists tab, off by default) makes a playlist for
+every genre with **more than 25** tracks: 26 qualifies, 25 doesn't. Only your Genre tags
+count. Nothing is guessed or looked up for this, and tags are never changed. Spellings
+of the same genre count together ("tech-house", "Tech_House", "TECH HOUSE"), as do the
+taxonomy's synonyms and family aliases ("UKG" → UK Garage, "DnB" → Drum & Bass).
+Each genre gets its own playlist, inside a folder for its family. A plain **House**
+playlist holds songs tagged just House, never every House subgenre. Vague tags
+("Electronic", "Dance & EDM") are left out. Genres that fit no family keep their own
+name. A Genre tag is always one genre, as rekordbox stores it: "House, Techno" counts
+as a genre of its own, not toward House and Techno. Run and Preview list each playlist
+and its track count first. If no genre has more than 25 tracks and nothing else is
+ticked, the app says no genres meet the threshold and changes nothing.
+
+```
+Organized
+└─ Popular Genres
+   ├─ House
+   │  ├─ House            ← tagged "House" only
+   │  ├─ Afro House
+   │  └─ Tech House
+   └─ Techno
+      └─ Melodic Techno
+```
+
 **Hot cues at phrase changes:** puts hot cues where each section of a track starts
 (Intro, Build-up, Drop, Breakdown, Chorus, Verse, Bridge, Outro), each named after
 its section. The positions come from rekordbox's own phrase analysis, so they land on

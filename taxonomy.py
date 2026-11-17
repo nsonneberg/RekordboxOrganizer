@@ -14,7 +14,10 @@ taxonomy.json file in the app's data folder (see load()). Example:
     }
 
 Families are matched by their words (see genres.family_of); a subgenre name
-or any of its synonyms resolves to that subgenre. A model label maps to
+or any of its synonyms resolves to that subgenre. A family's optional
+"aliases" are other spellings of the family's own name ("dnb" for Drum & Bass):
+unlike its words, which also route related genres to it, an alias means the
+family itself (used by the popular-genre playlists). A model label maps to
 "Family", "Family/Subgenre", a {"Family/Subgenre": weight} split for labels
 that sit between two families, or null for labels that say nothing useful.
 """
@@ -29,7 +32,8 @@ from typing import Optional
 ELECTRONIC_PARENT = "Electronic"
 
 DEFAULT: dict = {
-    # name -> {"parent", "words" (what tags mean this family), "subgenres": {name: [synonyms]}}
+    # name -> {"parent", "words" (what tags mean this family), "subgenres": {name: [synonyms]},
+    #          optional "aliases" (other spellings of the family's own name)}
     # Order matters only for ties in family_of.
     "families": {
         "House": {"parent": ELECTRONIC_PARENT,
@@ -43,6 +47,7 @@ DEFAULT: dict = {
                       "UK Garage": ["ukg", "2 step", "two step", "garage"],
                       "Speed Garage": [], "Bassline": ["bassline house", "niche"]}},
         "Techno": {"parent": ELECTRONIC_PARENT, "words": ["techno", "tekno", "minimal"],
+                   "aliases": ["tekno"],
                    "subgenres": {"Melodic Techno": [],
                                  "Minimal": ["minimal techno"], "Hard Techno": ["schranz"],
                                  "Peak Time Techno": ["peak time", "driving techno"],
@@ -56,6 +61,7 @@ DEFAULT: dict = {
         "Drum & Bass": {"parent": ELECTRONIC_PARENT,
                         "words": ["drum and bass", "dnb", "d and b", "drum n bass", "jungle",
                                   "liquid", "neurofunk", "jump up"],
+                        "aliases": ["dnb", "d and b", "drum n bass"],
                         "subgenres": {"Liquid": ["liquid funk", "liquid dnb"], "Neurofunk": [],
                                       "Jungle": [], "Jump Up": [], "Halftime": []}},
         "Dubstep": {"parent": ELECTRONIC_PARENT,
@@ -74,7 +80,8 @@ DEFAULT: dict = {
                               "Hands Up": [], "Moombahton": []}},
         "Hip Hop": {"parent": "", "words": ["hip hop", "rap", "trap", "drill", "boom bap", "grime"],
                     "subgenres": {"Trap": [], "Drill": [], "Boom Bap": [], "Grime": []}},
-        "R&B": {"parent": "", "words": ["r and b", "rnb", "soul", "neo soul"], "subgenres": {}},
+        "R&B": {"parent": "", "words": ["r and b", "rnb", "soul", "neo soul"],
+                "aliases": ["rnb", "r n b"], "subgenres": {}},
         "Pop": {"parent": "", "words": ["pop", "k pop"],
                 "subgenres": {"Dance Pop": ["dance-pop", "dance pop"], "Synth-pop": []}},
         "Latin": {"parent": "", "words": ["latin", "reggaeton", "dembow", "salsa", "bachata",
@@ -202,6 +209,8 @@ def merge(base: dict, override: dict) -> dict:
             fam["parent"] = str(spec["parent"] or "")
         if "words" in spec:
             fam["words"] = [str(w) for w in spec["words"]]
+        if "aliases" in spec:
+            fam["aliases"] = [str(a) for a in (spec["aliases"] or [])]
         for sub, synonyms in (spec.get("subgenres") or {}).items():
             fam["subgenres"][str(sub)] = [str(s) for s in (synonyms or [])]
     for section in ("discogs", "discogs_genres", "audioset", "typical_bpm"):
