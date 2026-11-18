@@ -179,8 +179,10 @@ class TornCopyTests(LiveLibraryCase):
         from sqlalchemy.exc import DatabaseError
         with mock.patch.object(rbdb, "_changed_since", return_value=False), \
                 self.during_copy(self.keep_working):
-            with self.assertRaisesRegex(DatabaseError, "database disk image is malformed"):
+            with self.assertRaises(ValueError) as ctx:      # "couldn't read a consistent copy"
                 self.preview()
+        self.assertIsInstance(ctx.exception.__cause__, DatabaseError)
+        self.assertIn("database disk image is malformed", str(ctx.exception.__cause__))
 
     def test_preview_stops_and_never_reads_the_copy(self):
         with self.watching_copies() as reads, self.during_copy(self.keep_working):

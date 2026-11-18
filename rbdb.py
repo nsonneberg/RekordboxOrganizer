@@ -158,6 +158,32 @@ def database_path(db) -> str:
     return str(db.engine.url.database)
 
 
+def locate_library() -> str:
+    """Where rekordbox's master.db is, found without ever connecting to it.
+
+    This relies on pyrekordbox's MasterDatabase never connecting while it's being
+    created. In the pinned versions (requirements.txt: >=0.5,<0.6; checked against
+    0.5.0) its constructor only reads pyrekordbox's settings, builds an SQLAlchemy
+    engine (which connects lazily, on the first query), parses masterPlaylists6.xml
+    as a plain XML file and starts a Session (also lazy). test_damaged_library checks
+    this at the DBAPI level: locating the library opens no sqlite3 or sqlcipher3
+    connection to it. If a new pyrekordbox changes that, those tests fail.
+
+    The engine is then told to refuse any connection before it's let go, so nothing
+    here can open the file: closing a connection to the library can fold
+    master.db-wal into master.db (SQLite does that when its last connection closes),
+    and a run mustn't change anything before its backup."""
+    from sqlalchemy import event
+    db = open_database()
+    try:
+        def refuse(*args, **kwargs):
+            raise RuntimeError("the live library is only located here, never opened")
+        event.listen(db.engine, "do_connect", refuse)
+        return database_path(db)
+    finally:
+        db.close()
+
+
 def library_path() -> str:
     """Where rekordbox's master.db is."""
     db = open_database()
@@ -487,8 +513,14 @@ def _prune(paths: list[str]) -> list[str]:
     return kept
 
 
-def backup(db_path: str) -> str:
+def backup(db_path: str, expected: Optional[dict[str, str]] = None) -> str:
     """Copy master.db with its log (and the playlist index); keep the newest few.
+
+    expected: {library file: SHA-256} of the checked copy a change was planned from.
+    If the backup isn't of exactly those files (the library changed in between), it's
+    still kept, as a backup of the library as it is now, but no older backup is
+    removed for it: one that doesn't match what the app read never pushes out a
+    good one. The caller then stops (see organizer._begin_write).
 
     Every file is checked byte-for-byte against the original, and once all are
     copied, the library is checked again: if anything changed meanwhile (rekordbox
@@ -504,8 +536,9 @@ def backup(db_path: str) -> str:
     _discard(_matching(folder, "master.organizer-backup-*.partial")
              + _matching(folder, "master.organizer-backup-*.unchecked"))
     dest = _free_name(folder, f"master.organizer-backup-{stamp}")
-    _save_snapshot(db_path, dest)
-    _prune(list_backups(folder)[KEEP_BACKUPS:])
+    copied = _save_snapshot(db_path, dest)
+    if expected is None or copied == expected:
+        _prune(list_backups(folder)[KEEP_BACKUPS:])
     return dest
 
 
@@ -1150,6 +1183,65 @@ def _tidy_undo_leftovers(db_path: str) -> None:
                 _discard([path])
 
 
+def _copy_library(src: str, work: str, running: Callable[[], bool]) -> dict[str, str]:
+    """Copy the library's files into work as one moment's library (see _check_snapshot):
+    {library file: SHA-256 of the bytes copied}. Raises LibraryChanged if it changed."""
+    files = _library_files(src)
+    copied = {}
+    for path, name in zip(files, ("master.db", "master.db-wal", "masterPlaylists6.xml")):
+        if _exists(path):
+            copied[path] = _copy_hashed(path, os.path.join(work, name))
+    _check_snapshot(copied, files, running)
+    return copied
+
+
+def _open_copy(src: str, work: str):
+    import pathlib
+    copy = open_database(os.path.join(work, "master.db"))
+    copy._share_dir = pathlib.Path(os.path.dirname(src)) / "share"    # analysis files
+    return copy
+
+
+def open_snapshot(db_path: str) -> tuple[object, str, dict[str, str]]:
+    """A run's checked copy of the library at db_path: (database, temp folder,
+    {library file: SHA-256}), found and copied by path alone, so the library itself
+    is never opened (see locate_library). Close it with close_preview_copy. Before
+    writing, the library must still match the hashes (unchanged_since) and its
+    backup be of exactly them (backup_is_of). As open_preview_copy, it raises
+    LibraryChanged if the library changed while it was copied, and leaves no temp
+    folder behind on any failure."""
+    import tempfile
+    copy = work = None
+    try:
+        work = tempfile.mkdtemp(prefix="rbo-snapshot-")
+        copied = _copy_library(db_path, work, rekordbox_app_running)
+        copy = _open_copy(db_path, work)
+    except BaseException:
+        close_preview_copy(copy, work)
+        raise
+    return copy, work, copied
+
+
+def unchanged_since(db_path: str, copied: dict[str, str]) -> bool:
+    """Whether the library's files are still exactly those copied (none gone or new)."""
+    return not _changed_since(copied, _library_files(db_path))
+
+
+def backup_is_of(backup_path: str, db_path: str, copied: dict[str, str]) -> bool:
+    """Whether a backup's record lists exactly the library files copied, with the same
+    SHA-256, and its files on disk still match the record."""
+    try:
+        record = _read_manifest(backup_path)
+    except (OSError, ValueError):
+        return False
+    if record is None:
+        return False
+    roles = dict(zip(("db", "wal", "xml"), _library_files(db_path)))
+    want = {role: copied[path] for role, path in roles.items() if path in copied}
+    have = {role: entry["sha256"] for role, entry in record["pieces"].items()}
+    return have == want and _unchanged_copy(backup_path)
+
+
 def open_preview_copy(db) -> tuple[object, str]:
     """Swap the open library for a copy to read or try a run on: (database, temp folder).
 
@@ -1163,7 +1255,6 @@ def open_preview_copy(db) -> tuple[object, str]:
     is thrown away unopened and this raises LibraryChanged. master.db-shm isn't copied:
     SQLite rebuilds it from the log, and a copied one could describe a different log.
     """
-    import pathlib
     import tempfile
 
     copy = work = None
@@ -1173,14 +1264,8 @@ def open_preview_copy(db) -> tuple[object, str]:
                 raise LibraryChanged(open_message(reading=True))
             src = database_path(db)
             work = tempfile.mkdtemp(prefix="rbo-preview-")
-            files = _library_files(src)
-            copied = {}
-            for path, name in zip(files, ("master.db", "master.db-wal", "masterPlaylists6.xml")):
-                if _exists(path):
-                    copied[path] = _copy_hashed(path, os.path.join(work, name))
-            _check_snapshot(copied, files, rekordbox_app_running)
-            copy = open_database(os.path.join(work, "master.db"))
-            copy._share_dir = pathlib.Path(os.path.dirname(src)) / "share"
+            _copy_library(src, work, rekordbox_app_running)
+            copy = _open_copy(src, work)
         finally:
             db.close()
     except BaseException:
