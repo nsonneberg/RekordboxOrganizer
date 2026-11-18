@@ -490,8 +490,19 @@ library changes while the app is copying it anyway, the app stops, throws the co
 away and says so; nothing in your library is changed. Run, saving genres and Undo also
 wait for rekordbox's background helper, `rekordboxAgent`, to be quit (in Activity
 Monitor on a Mac, or Task Manager on Windows), since it can change the library too.
+
+Run and saving genres also read and plan from a checked copy, and only open the
+library itself once it's backed up: closing even a reading connection to the library
+can fold `master.db-wal` into `master.db` (SQLite does that when its last connection
+closes). If the copy can't be read, the app stops with "Organizer couldn't read a
+consistent copy of your rekordbox library"; nothing in your library is changed and no
+backup is made.
+
 Before changing anything it saves a backup next to the library, named
-`master.organizer-backup-<date>.db`. It keeps the 3 most recent backups.
+`master.organizer-backup-<date>.db`, and checks it's of exactly the copy it read. It
+keeps the 3 most recent backups. If the library changed in between, that backup is
+still kept, as a backup of the library as it is now, but no older backup is removed
+for it, so there can be one more for a while.
 
 **Undo:** close rekordbox, press **Undo last run...**, pick the run, and press
 **Restore**. Your library goes back to how it was just before that run. Anything you
