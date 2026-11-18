@@ -1338,71 +1338,212 @@ def run(opt: Options, xml_path: Optional[str] = None, log: Callable[[str], None]
     if rbdb.rekordbox_app_running() if preview else rbdb.rekordbox_running():
         raise ValueError(rbdb.open_message("press " + ("Preview" if preview else "Run")
                                            + " again", reading=preview))
-    log("Opening your rekordbox library ...")
-    db = rbdb.open_database()
     if not preview:
-        _refuse_if_interrupted(db)
-    work = None
-    started = False
-    if preview:
-        db, work = rbdb.open_preview_copy(db)
+        return _run_on_library(opt, folder_name, log, progress, changes)
+    log("Opening your rekordbox library ...")
+    db, work = rbdb.open_preview_copy(rbdb.open_database())
     try:
-        db_path = rbdb.database_path(db)
-        tracks, contents = rbdb.load_tracks(db)
-        log(f"Found {len(tracks)} tracks.")
-        if not tracks:
-            raise ValueError("Your rekordbox collection is empty.")
-        changes.names.update((t.id, t.name) for t in tracks)
-        plan, ratings, chosen = _organize(tracks, opt, log, progress)
-        hot_cues = (rbdb.plan_hot_cues(db, chosen, log, opt.phrase_cues, opt.memory_cues)
-                    if opt.phrase_cues or opt.memory_cues else {})
-
-        if not preview:
-            if rbdb.rekordbox_running():
-                raise ValueError(f"{rbdb.who_started()} while working. Nothing was changed - "
-                                 "close it and press Run again.")
-            started = _begin_write(db_path, log)
-        rbdb.add_hot_cues(db, contents, hot_cues, log, changes,   # saved with the rest
-                          colours=opt.cue_colours)
-        if opt.energy and opt.energy_tags:
-            rbdb.write_energy_tags(db, {t.id: t.energy for t in chosen}, log, changes)
-        counts = rbdb.write_changes(db, contents, plan, folder_name, ratings, log,
-                                    opt.merge_existing, _evictor(plan, opt, chosen),
-                                    changes, commit=not preview)
-        describe_moves(counts[3], plan, tracks, log)
-        if plan:
-            log(describe_changes(*counts))
-        if started:
-            rbdb.end_change(db_path)
-        return db_path
-    except BaseException:
-        if started and not getattr(db, "commit_started", True):
-            rbdb.end_change(db_path)    # failed before saving anything: nothing to recover
-        raise
+        tracks, contents = _read_copy(db, log)
+        planned = _plan_run(db, tracks, opt, log, progress, changes)
+        _save_run(db, contents, tracks, planned, opt, folder_name, log, changes, commit=False)
+        return rbdb.database_path(db)
     finally:
         rbdb.close_preview_copy(db, work)
 
 
-def _refuse_if_interrupted(db) -> None:
+def _run_on_library(opt: Options, folder_name: str, log: Callable[[str], None],
+                    progress: Optional[Callable[[int, int], None]], changes: Changes) -> str:
+    """Run straight on rekordbox's library: planned on a checked copy, written only
+    once the library is backed up (see _change_library)."""
+    def plan(copy, tracks, _contents):
+        log(f"Found {len(tracks)} tracks.")
+        if not tracks:
+            raise ValueError("Your rekordbox collection is empty.")
+        return _plan_run(copy, tracks, opt, log, progress, changes)
+
+    def save(db, contents, tracks, planned):
+        _save_run(db, contents, tracks, planned, opt, folder_name, log, changes, commit=True)
+
+    return _change_library(log, plan, save, "press Run again")
+
+
+def _change_library(log: Callable[[str], None], plan: Callable, save: Callable,
+                    again: str) -> str:
+    """Change rekordbox's library, which is only opened once it's backed up.
+
+    Closing even a reading connection to the library can fold master.db-wal into
+    master.db (SQLite does that when its last connection closes), so everything up
+    to the backup works from a checked copy found and taken by path
+    (rbdb.open_snapshot): plan(copy, tracks, contents) reads it and decides what to
+    do, returning that without any of the copy's rows. A copy that can't be read
+    stops here with the library untouched. Then, before the library is opened:
+    rekordbox and rekordboxAgent must be closed, the library must still be exactly
+    what was copied, and a backup of exactly that must be saved and checked. Only
+    then is it opened and read again (it must read the same), and save(db,
+    contents, tracks, planned) changes it, committing. again: what to do to retry
+    ("press Run again"). Returns the library's path.
+    """
+    import rbdb
+    log("Opening your rekordbox library ...")
+    db_path = rbdb.locate_library()                 # by path: never connected to
+    _refuse_if_interrupted_at(db_path)
+    copy, work, copied = rbdb.open_snapshot(db_path)
+    try:
+        tracks, contents = _load_copy(copy)
+        planned = plan(copy, tracks, contents)
+    finally:
+        rbdb.close_preview_copy(copy, work)
+
+    changed = CHANGED_SINCE_READ.format(again=again)
+    if rbdb.rekordbox_running():
+        raise ValueError(f"{rbdb.who_started()} while working. Nothing was changed - "
+                         f"close it and {again}.")
+    if not rbdb.unchanged_since(db_path, copied):
+        raise rbdb.LibraryChanged(changed)
+    saved = _begin_write(db_path, log, copied, changed)
+    db = None
+    try:
+        if not rbdb.unchanged_since(db_path, copied):
+            raise rbdb.LibraryChanged(changed)
+        db = rbdb.open_database(db_path)
+        try:
+            live_tracks, live_contents = rbdb.load_tracks(db)
+        except Exception as exc:      # read fine as a copy: say what's safe now
+            raise ValueError(LIVE_UNREADABLE.format(
+                backup=os.path.basename(saved), error=_first_line(exc), again=again)) from exc
+        if live_tracks != tracks:
+            raise ValueError("Your rekordbox library read differently from the checked copy "
+                             f"of it, so nothing was changed. {again[0].upper()}{again[1:]}.")
+        save(db, live_contents, tracks, planned)
+        rbdb.end_change(db_path)
+        return db_path
+    except BaseException:
+        if db is None or not db.commit_started:
+            rbdb.end_change(db_path)    # failed before saving anything: nothing to recover
+        raise
+    finally:
+        if db is not None:
+            db.close()
+
+
+def _plan_run(db, tracks: list[Track], opt: Options, log: Callable[[str], None],
+              progress: Optional[Callable[[int, int], None]], changes: Changes) -> tuple:
+    """Everything a run decides, from a copy: (plan, ratings, chosen, hot cues). Holds
+    no rows from db, so it can be saved into another open copy of the same library."""
+    import rbdb
+    changes.names.update((t.id, t.name) for t in tracks)
+    plan, ratings, chosen = _organize(tracks, opt, log, progress)
+    hot_cues = (rbdb.plan_hot_cues(db, chosen, log, opt.phrase_cues, opt.memory_cues)
+                if opt.phrase_cues or opt.memory_cues else {})
+    return plan, ratings, chosen, hot_cues
+
+
+def _save_run(db, contents: dict, tracks: list[Track], planned: tuple, opt: Options,
+              folder_name: str, log: Callable[[str], None], changes: Changes,
+              commit: bool) -> None:
+    import rbdb
+    plan, ratings, chosen, hot_cues = planned
+    rbdb.add_hot_cues(db, contents, hot_cues, log, changes,   # saved with the rest
+                      colours=opt.cue_colours)
+    if opt.energy and opt.energy_tags:
+        rbdb.write_energy_tags(db, {t.id: t.energy for t in chosen}, log, changes)
+    counts = rbdb.write_changes(db, contents, plan, folder_name, ratings, log,
+                                opt.merge_existing, _evictor(plan, opt, chosen),
+                                changes, commit=commit)
+    describe_moves(counts[3], plan, tracks, log)
+    if plan:
+        log(describe_changes(*counts))
+
+
+UNREADABLE = ("Organizer couldn't read a consistent copy of your rekordbox library: reading "
+              "{table} failed with \"{error}\". The copy matched your library's files exactly, "
+              "before and after copying, so this isn't a copying problem. {cause} Your "
+              "library itself wasn't opened: nothing in it was changed and no backup was made. "
+              "Please don't run Organizer on this library until rekordbox opens it without "
+              "problems.")
+CAUSE_MALFORMED = ("Organizer can't tell from this whether the cause is master.db or its log, "
+                   "master.db-wal.")
+CAUSE_NOT_A_DATABASE = ("This error usually means the copy couldn't be decrypted: Organizer "
+                        "may not have the right key for this library, or its version of "
+                        "SQLCipher may not read the library's format. It can also come from a "
+                        "problem in master.db or its log, master.db-wal; Organizer can't tell "
+                        "which.")
+
+LIVE_UNREADABLE = ("Organizer backed up your library to {backup}, but then couldn't read the "
+                   "library itself (\"{error}\"), so nothing was changed. The backup matches "
+                   "your library exactly as Organizer first read it. Closing the library may "
+                   "have let SQLite fold master.db-wal into master.db; if rekordbox shows "
+                   "anything wrong, use Undo to put that backup back. Please don't {again} "
+                   "until rekordbox opens the library without problems.")
+
+CHANGED_SINCE_READ = ("Your rekordbox library changed after Organizer read it (rekordbox or "
+                      "its helper, rekordboxAgent, may have saved), so nothing was changed. "
+                      "Close rekordbox and rekordboxAgent, then {again}.")
+
+
+def _unreadable(exc: BaseException) -> bool:
+    """Whether exc is SQLite (or SQLCipher) failing to read the database file itself."""
+    text = str(exc).lower()
+    return "malformed" in text or "file is not a database" in text
+
+
+def _load_copy(db) -> tuple[list[Track], dict]:
+    """rbdb.load_tracks on a checked copy, saying plainly when the copy can't be read."""
+    import rbdb
+    try:
+        return rbdb.load_tracks(db)
+    except Exception as exc:
+        if not _unreadable(exc):
+            raise
+        found = re.search(r'\bFROM "?(\w+)', str(exc))
+        error = _first_line(exc)
+        cause = (CAUSE_NOT_A_DATABASE if "file is not a database" in error.lower()
+                 else CAUSE_MALFORMED)
+        raise ValueError(UNREADABLE.format(table=found.group(1) if found else "it",
+                                           error=error, cause=cause)) from exc
+
+
+def _first_line(exc: BaseException) -> str:
+    """The database's own error, without SQLAlchemy's query and parameters."""
+    return str(getattr(exc, "orig", None) or exc).splitlines()[0]
+
+
+def _read_copy(db, log: Callable[[str], None]) -> tuple[list[Track], dict]:
+    """_load_copy for a preview run: says how many tracks, and stops if there are none."""
+    tracks, contents = _load_copy(db)
+    log(f"Found {len(tracks)} tracks.")
+    if not tracks:
+        raise ValueError("Your rekordbox collection is empty.")
+    return tracks, contents
+
+
+def _refuse_if_interrupted_at(db_path: str) -> None:
     """Stop if an earlier change didn't finish (see rbdb.begin_change); nothing is written."""
     import rbdb
-    info = rbdb.interrupted_change(rbdb.database_path(db))
+    info = rbdb.interrupted_change(db_path)
     if info is not None:
-        db.close()
         raise ValueError(rbdb.interrupted_message(info))
 
 
-def _begin_write(db_path: str, log: Callable[[str], None]) -> bool:
-    """Back up the library and mark a change as in progress. Raises (writing
-    nothing) if the backup can't be made and checked."""
+def _begin_write(db_path: str, log: Callable[[str], None],
+                 copied: Optional[dict] = None, changed: str = "") -> str:
+    """Back up the library and mark a change as in progress; returns the backup's
+    path. Raises (writing nothing) if the backup can't be made and checked. copied:
+    the checked copy a run read ({library file: SHA-256}); the backup must be of
+    exactly those files, or this raises LibraryChanged saying `changed` (and that
+    backup, of the library as it is now, is kept without removing any older one)."""
     import rbdb
     try:
-        saved = rbdb.backup(db_path)
+        saved = rbdb.backup(db_path, expected=copied)
     except OSError as exc:
         raise ValueError(f"Couldn't back up your library, so nothing was changed: {exc}") from exc
+    if copied is not None and not rbdb.backup_is_of(saved, db_path, copied):
+        raise rbdb.LibraryChanged(
+            changed + f" (The backup just made, {os.path.basename(saved)}, is of "
+            "the library as it is now, and is kept.)")
     log(f"Backed up your library to {os.path.basename(saved)}")
     rbdb.begin_change(db_path, saved)
-    return True
+    return saved
 
 
 def confidence_text(value: float) -> str:
@@ -1570,7 +1711,9 @@ def genre_review(xml_path: Optional[str] = None, log: Callable[[str], None] = pr
 def save_genres(new: dict[str, str], log: Callable[[str], None] = print,
                 preview: bool = False, changes: Optional[Changes] = None,
                 suggested: Optional[dict[str, str]] = None) -> str:
-    """Write {track id: genre} into rekordbox (backed up first). Returns the library path.
+    """Write {track id: genre} into rekordbox (backed up first). Returns the path of
+    rekordbox's own master.db, for a preview too: a preview only reads and changes a
+    temporary copy (deleted afterwards), and nothing is written to the library.
 
     suggested: {track id: the app's guess or suggestion shown for it}. A
     genre saved unchanged from it is remembered as "accepted" (not learned
@@ -1580,38 +1723,34 @@ def save_genres(new: dict[str, str], log: Callable[[str], None] = print,
     import rbdb
     if rbdb.rekordbox_app_running() if preview else rbdb.rekordbox_running():
         raise ValueError(rbdb.open_message("save again", reading=preview))
-    db = rbdb.open_database()
-    db_path = rbdb.database_path(db)
-    if not preview:
-        _refuse_if_interrupted(db)
-    work = None
-    started = False
     if preview:
-        db, work = rbdb.open_preview_copy(db)
-    try:
-        _, contents = rbdb.load_tracks(db)
-        original = {tid: (contents[tid].GenreName or "").strip() if tid in contents else ""
-                    for tid in new}
-        if not preview:
-            started = _begin_write(db_path, log)
-        rbdb.write_genres(db, contents, new, log, changes)
-        if preview:
+        live = rbdb.open_database()               # only its path is used (never connected)
+        db_path = rbdb.database_path(live)
+        db, work = rbdb.open_preview_copy(live)
+        try:
+            _, contents = _load_copy(db)
+            rbdb.write_genres(db, contents, new, log, changes)
             db.rollback()
-        else:
-            db.commit()
-            rbdb.end_change(db_path)
-            import genres
-            suggested = suggested or {}
-            try:
-                genres.record_labels({tid: (genre, "accepted" if suggested.get(tid) == genre
-                                            else "corrected", original[tid])
-                                      for tid, genre in new.items()})
-            except OSError as exc:
-                log(f"  (Couldn't remember which genres you chose: {exc})")
-        return db_path
-    except BaseException:
-        if started and not getattr(db, "commit_started", True):
-            rbdb.end_change(db_path)
-        raise
-    finally:
-        rbdb.close_preview_copy(db, work)
+            return db_path
+        finally:
+            rbdb.close_preview_copy(db, work)
+
+    original: dict[str, str] = {}               # each song's genre before saving
+
+    def plan(_copy, _tracks, contents):
+        original.update({tid: (contents[tid].GenreName or "").strip() if tid in contents
+                         else "" for tid in new})
+
+    def save(db, contents, _tracks, _planned):
+        rbdb.write_genres(db, contents, new, log, changes)
+        db.commit()
+    db_path = _change_library(log, plan, save, "save again")
+    import genres
+    suggested = suggested or {}
+    try:
+        genres.record_labels({tid: (genre, "accepted" if suggested.get(tid) == genre
+                                    else "corrected", original[tid])
+                              for tid, genre in new.items()})
+    except OSError as exc:
+        log(f"  (Couldn't remember which genres you chose: {exc})")
+    return db_path
